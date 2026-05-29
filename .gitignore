@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+geotagger_app.log
+*.log
+
+transects_output/
+transects_output_batch/
+transects_json/
+geotagged_*/
+Extracted_Images_*/
+
+*.tmp
+*.html.tmp
