@@ -142,6 +142,7 @@ def parse_gpx_file(gpx_file_path):
 
     df = pd.DataFrame(points)
     df['time'] = pd.to_datetime(df['time'], utc=True)
+    df['gps_time_identified'] = df['time'].notna()
     df = df.set_index('time')
     return df
 
@@ -180,22 +181,28 @@ def parse_boat_log_csv(csv_file_path, lat_col, lon_col, boat_timezone_str,
     else:
         raise ValueError("Either datetime_col or both date_col and time_col must be provided.")
 
-    # Convert to datetime objects, coercing errors to NaT (Not a Time)
+    # Convert to datetime objects, coercing errors to NaT (Not a Time).
+    # Rows with unparseable timestamps are kept so their coordinates can still
+    # be shown on the map; time-based interpolation ignores NaT-indexed rows.
     timestamps_naive = pd.to_datetime(timestamp_series, format=datetime_format, errors='coerce')
-
-    # Drop rows where timestamp parsing failed
-    df = df[timestamps_naive.notna()]
-    timestamps_naive = timestamps_naive[timestamps_naive.notna()]
 
     # Localize the naive timestamps to the specified timezone, then convert to UTC
     tz = pytz.timezone(boat_timezone_str)
-    timestamps_utc = timestamps_naive.dt.tz_localize(tz, ambiguous='infer').dt.tz_convert('UTC')
-
-    df.index = timestamps_utc
+    valid_timestamp_mask = timestamps_naive.notna()
+    timestamps_utc = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')
+    if valid_timestamp_mask.any():
+        timestamps_utc.loc[valid_timestamp_mask] = (
+            timestamps_naive.loc[valid_timestamp_mask]
+            .dt.tz_localize(tz, ambiguous='infer')
+            .dt.tz_convert('UTC')
+        )
 
     # --- GPS data processing ---
     df_out = df[[lat_col, lon_col]].copy()
     df_out.rename(columns={lat_col: 'latitude', lon_col: 'longitude'}, inplace=True)
+    df_out['gps_time_identified'] = valid_timestamp_mask
+    df_out['raw_timestamp'] = timestamp_series
+    df_out.index = pd.DatetimeIndex(timestamps_utc, name='time')
     
     if alt_col and alt_col in df.columns:
         df_out['elevation'] = pd.to_numeric(df[alt_col], errors='coerce')
@@ -275,6 +282,11 @@ def interpolate_gps_position(gps_df, target_time_utc, max_extrapolation_seconds=
 
     if gps_df.empty:
         return None
+
+    if isinstance(gps_df.index, pd.DatetimeIndex) and gps_df.index.hasnans:
+        gps_df = gps_df[~gps_df.index.isna()].copy()
+        if gps_df.empty:
+            return None
 
     track_min = gps_df.index.min()
     track_max = gps_df.index.max()

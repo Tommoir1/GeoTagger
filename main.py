@@ -61,6 +61,35 @@ except ImportError:
     engine = None
     ENGINE_AVAILABLE = False
 
+GPS_TIME_NOT_IDENTIFIED = "Time was not identified"
+
+
+def _gps_time_missing_count(gps_df):
+    if gps_df is None or gps_df.empty or not isinstance(gps_df.index, pd.DatetimeIndex):
+        return 0
+    return int(gps_df.index.isna().sum())
+
+
+def _timed_gps_df(gps_df):
+    if gps_df is None or gps_df.empty or not isinstance(gps_df.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    return gps_df[~gps_df.index.isna()].copy()
+
+
+def _gps_index_is_utc_or_time_missing(index):
+    if not isinstance(index, pd.DatetimeIndex):
+        return False
+    if index.tz is None:
+        return False
+    timed_index = index[~index.isna()]
+    if len(timed_index) == 0:
+        return True
+    return index.tz.utcoffset(timed_index.min()) == timedelta(0)
+
+
+def _gps_timestamp_identified(timestamp):
+    return isinstance(timestamp, pd.Timestamp) and pd.notna(timestamp)
+
 # --- Set up logging for GUI ---
 class QTextEditLogger(logging.Handler):
     def __init__(self, text_edit_widget):
@@ -200,13 +229,12 @@ class WorkerThread(QThread):
                     self.log("GPS index is naive. Assuming UTC.", logging.WARNING)
                     try:
                         gps_df.index = gps_df.index.tz_localize('UTC', ambiguous='NaT', nonexistent='NaT')
-                        gps_df.dropna(subset=[gps_df.index.name], inplace=True)
                     except Exception as tz_err:
                         err_msg = f"Failed to localize naive GPS index to UTC: {tz_err}"
                         self.log(err_msg, logging.ERROR)
                         self.error_occurred.emit(err_msg)
                         return
-                elif gps_df.index.tz.utcoffset(gps_df.index.min()) != timedelta(0):
+                elif not _gps_index_is_utc_or_time_missing(gps_df.index):
                     self.log("GPS index not UTC. Converting...", logging.WARNING)
                     try:
                         gps_df.index = gps_df.index.tz_convert('UTC')
@@ -218,6 +246,13 @@ class WorkerThread(QThread):
                 if not gps_df.index.is_monotonic_increasing:
                     self.log("Sorting GPS data by time.", logging.INFO)
                     gps_df.sort_index(inplace=True)
+                missing_time_count = _gps_time_missing_count(gps_df)
+                if missing_time_count:
+                    self.log(
+                        f"{GPS_TIME_NOT_IDENTIFIED} for {missing_time_count} GPS point(s). "
+                        "They will be shown on the map but ignored for time-based georeferencing.",
+                        logging.WARNING
+                    )
 
             gps_df_final = gps_df
             self.progress.emit(15)
@@ -270,7 +305,8 @@ class WorkerThread(QThread):
                 self.results_df = pd.DataFrame(columns=['Identifier', 'File Path', 'Original Timestamp', 'Corrected Timestamp (UTC)', 'Latitude', 'Longitude'])
             else:
                 media_data_tz_obj = pytz.timezone(tz_str)
-                valid_gps_for_interp = gps_df_final is not None and not gps_df_final.empty
+                gps_df_for_interp = _timed_gps_df(gps_df_final)
+                valid_gps_for_interp = gps_df_for_interp is not None and not gps_df_for_interp.empty
 
                 for i, item in enumerate(media_items):
                     lat, lon = None, None
@@ -295,7 +331,7 @@ class WorkerThread(QThread):
 
                             if valid_gps_for_interp:
                                 try:
-                                    pos_result = engine.interpolate_gps_position(gps_df_final, corr_utc)
+                                    pos_result = engine.interpolate_gps_position(gps_df_for_interp, corr_utc)
                                     if pos_result is not None:
                                         if isinstance(pos_result, (tuple, list)) and len(pos_result) >= 2:
                                             lat, lon = pos_result[0], pos_result[1]
@@ -382,7 +418,7 @@ class WorkerThread(QThread):
                 gps_map_df['latitude'] = pd.to_numeric(gps_map_df['latitude'], errors='coerce')
                 gps_map_df['longitude'] = pd.to_numeric(gps_map_df['longitude'], errors='coerce')
                 valid_gps_df = gps_map_df.dropna(subset=req).copy()
-                if not isinstance(valid_gps_df.index, pd.DatetimeIndex) or valid_gps_df.index.tz is None or valid_gps_df.index.tz.utcoffset(valid_gps_df.index.min()) != timedelta(0):
+                if not _gps_index_is_utc_or_time_missing(valid_gps_df.index):
                     self.log("[Worker] GPS index invalid map.", logging.ERROR)
                     return None
                 if not valid_gps_df.index.is_monotonic_increasing:
@@ -390,6 +426,9 @@ class WorkerThread(QThread):
                 if not valid_gps_df.empty:
                     has_valid_gps = True
                     self.log(f"[Worker] Using {len(valid_gps_df)} valid GPS points for map.")
+                    missing_time_count = _gps_time_missing_count(valid_gps_df)
+                    if missing_time_count:
+                        self.log(f"{GPS_TIME_NOT_IDENTIFIED} for {missing_time_count} mapped GPS point(s).", logging.WARNING)
             except Exception as e:
                 self.log(f"[Worker] Error prep GPS map: {e}", logging.ERROR)
                 has_valid_gps = False
@@ -571,34 +610,48 @@ function clearAllSavedTransectLines() {
                     show=True,
                     overlay=True
                 ).add_to(m)
-                for ts, row in valid_gps_df.iterrows():
-                    if not isinstance(ts, pd.Timestamp):
-                        continue
-                    ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-                    ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
-                    js_call = (
-                        f"sendClickedGpsTimestampToPython('{ts_iso}', event.ctrlKey, event.shiftKey); "
-                        "var m=null;for(var k in window){if(window[k] instanceof L.Map){m=window[k];break;}} "
-                        "if(m){m.closePopup();};"
-                    )
-                    escaped_js = js_call.replace('"', '&quot;')
-                    popup_html = (
-                        f'<b>GPS Point</b><br>'
-                        f'Time: {ts_tip}<br>'
-                        f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                        f'<button type="button" onclick="{escaped_js}">Select This Point</button>'
-                    )
+                for _, (ts, row) in enumerate(valid_gps_df.iterrows()):
+                    marker_options = {}
+                    marker_color = 'blue'
+                    marker_fill = 'blue'
+                    tooltip = GPS_TIME_NOT_IDENTIFIED
+                    if _gps_timestamp_identified(ts):
+                        ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                        ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
+                        js_call = (
+                            f"sendClickedGpsTimestampToPython('{ts_iso}', event.ctrlKey, event.shiftKey); "
+                            "var m=null;for(var k in window){if(window[k] instanceof L.Map){m=window[k];break;}} "
+                            "if(m){m.closePopup();};"
+                        )
+                        escaped_js = js_call.replace('"', '&quot;')
+                        popup_html = (
+                            f'<b>GPS Point</b><br>'
+                            f'Time: {ts_tip}<br>'
+                            f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
+                            f'<button type="button" onclick="{escaped_js}">Select This Point</button>'
+                        )
+                        tooltip = f"Click to open: {ts_tip}"
+                        marker_options = {'customTimestamp': ts_iso}
+                    else:
+                        marker_color = 'gray'
+                        marker_fill = 'gray'
+                        popup_html = (
+                            f'<b>GPS Point</b><br>'
+                            f'<b>{GPS_TIME_NOT_IDENTIFIED}</b><br>'
+                            f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
+                            'This point cannot be used for time-based transects.'
+                        )
                     folium.CircleMarker(
                         location=[row['latitude'], row['longitude']],
                         radius=4,
-                        color='blue',
+                        color=marker_color,
                         weight=1,
                         fill=True,
-                        fill_color='blue',
+                        fill_color=marker_fill,
                         fill_opacity=0.6,
                         popup=folium.Popup(popup_html, max_width=250),
-                        tooltip=f"Click to open: {ts_tip}",
-                        options={'customTimestamp': ts_iso}
+                        tooltip=tooltip,
+                        options=marker_options
                     ).add_to(gps_group)
             if has_valid_results:
                 img_cluster = folium.plugins.MarkerCluster(name="Images", show=True, overlay=True).add_to(m)
@@ -1515,13 +1568,14 @@ class GeoTaggerApp(QWidget):
             self.log_message("Building spatial index (k-d tree) for GPS track for fast lookups...", logging.INFO)
             try:
                 # Store a clean DataFrame with only valid lat/lon for indexing
-                self.gps_kdtree_df_map = self.processed_gps_df[['latitude', 'longitude']].dropna().copy()
+                timed_gps_for_lookup = _timed_gps_df(self.processed_gps_df)
+                self.gps_kdtree_df_map = timed_gps_for_lookup[['latitude', 'longitude']].dropna().copy()
                 if not self.gps_kdtree_df_map.empty:
                     self.gps_coordinates_for_kdtree = self.gps_kdtree_df_map.values
                     self.gps_kdtree = cKDTree(self.gps_coordinates_for_kdtree)
                     self.log_message(f"Spatial index built successfully with {len(self.gps_kdtree_df_map)} points.", logging.INFO)
                 else:
-                    self.log_message("No valid coordinates found in GPS data to build spatial index.", logging.WARNING)
+                    self.log_message("No timestamped GPS coordinates found to build spatial index.", logging.WARNING)
             except Exception as e:
                 self.log_message(f"Failed to build spatial index: {e}", logging.ERROR)
                 self.gps_kdtree = None
@@ -1542,18 +1596,25 @@ class GeoTaggerApp(QWidget):
         self.date_filter_combo.addItem("Show All Dates")
         self.available_dates = []
 
+        timed_processed_gps_df = _timed_gps_df(self.processed_gps_df)
+        missing_time_count = _gps_time_missing_count(self.processed_gps_df)
+        if missing_time_count:
+            self.log_message(
+                f"{GPS_TIME_NOT_IDENTIFIED} for {missing_time_count} GPS point(s). "
+                "They remain visible on the map and are excluded from date filtering.",
+                logging.WARNING
+            )
+
         base_gps_valid_for_date_filter = False
-        if self.processed_gps_df is not None and \
-           isinstance(self.processed_gps_df, pd.DataFrame) and \
-           not self.processed_gps_df.empty and \
-           isinstance(self.processed_gps_df.index, pd.DatetimeIndex) and \
-           self.processed_gps_df.index.tz is not None and \
-           self.processed_gps_df.index.tz.utcoffset(self.processed_gps_df.index.min()) == timedelta(0):
+        if timed_processed_gps_df is not None and \
+           isinstance(timed_processed_gps_df, pd.DataFrame) and \
+           not timed_processed_gps_df.empty and \
+           _gps_index_is_utc_or_time_missing(timed_processed_gps_df.index):
             base_gps_valid_for_date_filter = True
             self.log_message(f"Stored processed GPS data ({len(self.processed_gps_df)} points). Populating date filter.", logging.INFO)
             try:
                 target_tz = pytz.timezone(self.current_timezone_str)
-                local_times = self.processed_gps_df.index.tz_convert(target_tz)
+                local_times = timed_processed_gps_df.index.tz_convert(target_tz)
                 unique_dates = sorted(list(set(dt.date() for dt in local_times)))
                 self.available_dates = unique_dates
                 for date_obj in self.available_dates:
@@ -2794,7 +2855,8 @@ class GeoTaggerApp(QWidget):
                 self.available_dates = []
                 try:
                     target_tz_obj = pytz.timezone(self.current_timezone_str)
-                    local_times = self.processed_gps_df.index.tz_convert(target_tz_obj)
+                    timed_processed_gps_df = _timed_gps_df(self.processed_gps_df)
+                    local_times = timed_processed_gps_df.index.tz_convert(target_tz_obj)
                     unique_dates = sorted(list(set(dt.date() for dt in local_times)))
                     self.available_dates = unique_dates
                     for date_obj in self.available_dates:
@@ -3803,14 +3865,15 @@ class GeoTaggerApp(QWidget):
                     temp['latitude'] = pd.to_numeric(temp['latitude'], errors='coerce')
                     temp['longitude'] = pd.to_numeric(temp['longitude'], errors='coerce')
                     valid_gps_df_map = temp.dropna(subset=['latitude','longitude']).copy()
-                    if isinstance(valid_gps_df_map.index, pd.DatetimeIndex) and \
-                       valid_gps_df_map.index.tz is not None and \
-                       valid_gps_df_map.index.tz.utcoffset(valid_gps_df_map.index.min()) == timedelta(0): # Ensure UTC
+                    if _gps_index_is_utc_or_time_missing(valid_gps_df_map.index):
                         if not valid_gps_df_map.index.is_monotonic_increasing:
                              valid_gps_df_map.sort_index(inplace=True)
                         if not valid_gps_df_map.empty:
                             has_valid_gps = True
                             self.log_message(f"[App] Using {len(valid_gps_df_map)} valid GPS points for map.")
+                            missing_time_count = _gps_time_missing_count(valid_gps_df_map)
+                            if missing_time_count:
+                                self.log_message(f"{GPS_TIME_NOT_IDENTIFIED} for {missing_time_count} mapped GPS point(s).", logging.WARNING)
                     else:
                         self.log_message("[App] GPS DF for map has invalid or non-UTC index.", logging.WARNING)
 
@@ -3988,18 +4051,32 @@ function clearAllSavedTransectLines() {
 
             if has_valid_gps:
                 gps_group = folium.FeatureGroup(name="GPS Track (Click for Transect)", show=True, overlay=True).add_to(m)
-                for ts, row in valid_gps_df_map.iterrows():
-                    ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00','Z')
-                    ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
-                    js_call = f"sendClickedGpsTimestampToPython('{ts_iso}',event.ctrlKey,event.shiftKey); var m=null;for(var k in window){{if(window[k] instanceof L.Map){{m=window[k];break;}}}} if(m){{m.closePopup();}};"
-                    escaped_js = js_call.replace('"', '&quot;')
-                    popup_html = (f'<b>GPS Point</b><br>'
-                                  f'Time: {ts_tip}<br>'
-                                  f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                                  f'<button type="button" onclick="{escaped_js}">Select This Point</button>')
-                    folium.CircleMarker([row['latitude'],row['longitude']], radius=4, color='blue', weight=1, fill=True, fill_color='blue', fill_opacity=0.6,
-                                        popup=folium.Popup(popup_html, max_width=250), tooltip=f"Click to open: {ts_tip}",
-                                        options={'customTimestamp': ts_iso}).add_to(gps_group)
+                for _, (ts, row) in enumerate(valid_gps_df_map.iterrows()):
+                    marker_options = {}
+                    marker_color = 'blue'
+                    marker_fill = 'blue'
+                    tooltip = GPS_TIME_NOT_IDENTIFIED
+                    if _gps_timestamp_identified(ts):
+                        ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00','Z')
+                        ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
+                        js_call = f"sendClickedGpsTimestampToPython('{ts_iso}',event.ctrlKey,event.shiftKey); var m=null;for(var k in window){{if(window[k] instanceof L.Map){{m=window[k];break;}}}} if(m){{m.closePopup();}};"
+                        escaped_js = js_call.replace('"', '&quot;')
+                        popup_html = (f'<b>GPS Point</b><br>'
+                                      f'Time: {ts_tip}<br>'
+                                      f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
+                                      f'<button type="button" onclick="{escaped_js}">Select This Point</button>')
+                        tooltip = f"Click to open: {ts_tip}"
+                        marker_options = {'customTimestamp': ts_iso}
+                    else:
+                        marker_color = 'gray'
+                        marker_fill = 'gray'
+                        popup_html = (f'<b>GPS Point</b><br>'
+                                      f'<b>{GPS_TIME_NOT_IDENTIFIED}</b><br>'
+                                      f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
+                                      'This point cannot be used for time-based transects.')
+                    folium.CircleMarker([row['latitude'],row['longitude']], radius=4, color=marker_color, weight=1, fill=True, fill_color=marker_fill, fill_opacity=0.6,
+                                        popup=folium.Popup(popup_html, max_width=250), tooltip=tooltip,
+                                        options=marker_options).add_to(gps_group)
             if has_valid_results:
                 img_group = folium.plugins.MarkerCluster(name="Images", show=True, overlay=True).add_to(m)
                 for _, row in valid_results_df_map.iterrows():

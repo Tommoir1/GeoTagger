@@ -109,6 +109,8 @@ When parsing CSV/TXT GPS logs, choose the matching timestamp format string, for 
 
 The selected **Data Timezone** is used to localize naive CSV timestamps before converting them internally for processing.
 
+Rows with valid latitude/longitude but unparseable timestamps are still shown on the map. Their popups display **Time was not identified**, and those points are excluded from time-based georeferencing, transect picks, and date filtering.
+
 ## Image Inputs
 
 GeoTagger recursively scans the selected image folder for supported image types:
