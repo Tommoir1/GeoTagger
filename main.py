@@ -7,6 +7,7 @@ import shutil
 import csv
 import traceback
 import json # Required for JS communication AND transect save/load
+import html
 
 try:
     from scipy.spatial import cKDTree
@@ -20,18 +21,18 @@ except ImportError:
 # --- PyQt6 Imports ---
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QLineEdit, QFileDialog,
-                             QSpinBox, QDateTimeEdit, QRadioButton, QGroupBox,
+                             QDateTimeEdit, QRadioButton, QGroupBox,
                              QTableWidget, QTableWidgetItem, QMessageBox,
                              QProgressBar, QTabWidget, QTextEdit, QComboBox,
                              QGridLayout, QDoubleSpinBox, QCompleter, QAbstractItemView,
                              QSizePolicy, QInputDialog, QCheckBox, QListWidget, QListWidgetItem,
-                             QSplitter) # Added QSplitter
+                             QSplitter, QScrollArea, QFrame, QHeaderView, QDialog,
+                             QToolButton, QButtonGroup)
 from PyQt6.QtCore import (QObject, pyqtSlot, QThread, pyqtSignal, Qt, QUrl,
-                          QTimer, QDateTime, QItemSelectionModel, QItemSelection,
-                          QItemSelectionRange, QEvent)
+                          QTimer, QDateTime, QSettings, QSize)
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile, QWebEnginePage
+from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile
 from PyQt6.QtGui import QPalette, QColor, QIcon, QPixmap
 
 # --- Data Handling ---
@@ -40,6 +41,8 @@ import numpy as np
 import folium
 import folium.plugins
 import pytz
+
+from file_utils import copy_file_safely
 
 # --- Spatial Calculation ---
 try:
@@ -62,6 +65,170 @@ except ImportError:
     ENGINE_AVAILABLE = False
 
 GPS_TIME_NOT_IDENTIFIED = "Time was not identified"
+DEFAULT_DATA_TIMEZONE = "Australia/Sydney"
+CONTINUOUS_CAMERA_MAX_GAP_SECONDS = 30 * 60
+ESRI_WORLD_IMAGERY_TILES = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+ESRI_WORLD_IMAGERY_CLARITY_TILES = (
+    "https://clarity.maptiles.arcgis.com/arcgis/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+ESRI_REFERENCE_TILES = (
+    "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/"
+    "World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+)
+
+
+def _continuous_camera_group_chains(
+    groups,
+    max_gap_seconds=CONTINUOUS_CAMERA_MAX_GAP_SECONDS,
+):
+    """Group adjacent folders that belong to one uninterrupted camera clock."""
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda group_and_times: (
+            min(group_and_times[1]),
+            group_and_times[0].casefold(),
+        ),
+    )
+    chains = []
+    for time_group, image_times in ordered_groups:
+        if not chains:
+            chains.append([(time_group, image_times)])
+            continue
+        previous_times = chains[-1][-1][1]
+        gap_seconds = (min(image_times) - max(previous_times)).total_seconds()
+        if 0 <= gap_seconds <= max_gap_seconds:
+            chains[-1].append((time_group, image_times))
+        else:
+            chains.append([(time_group, image_times)])
+    return chains
+
+
+def _add_imagery_basemaps(map_object):
+    """Add imagery choices suited to coastal visual matching."""
+    folium.TileLayer(
+        tiles=ESRI_WORLD_IMAGERY_TILES,
+        attr=(
+            "Source: Esri, Vantor, Earthstar Geographics, "
+            "and the GIS User Community"
+        ),
+        name="Satellite - Latest",
+        overlay=False,
+        control=True,
+        show=True,
+        max_zoom=21,
+        # Remote islands commonly stop at z18. Overzoom the last real tile
+        # instead of replacing the shoreline with a "data unavailable" tile.
+        max_native_zoom=18,
+    ).add_to(map_object)
+    folium.TileLayer(
+        tiles=ESRI_WORLD_IMAGERY_CLARITY_TILES,
+        attr=(
+            "Source: Esri, Vantor, Earthstar Geographics, IGN, "
+            "and the GIS User Community"
+        ),
+        name="Satellite - Clarity",
+        overlay=False,
+        control=True,
+        show=False,
+        max_zoom=21,
+        # Clarity is especially useful as an alternate shoreline image, but
+        # its native coverage can be shallower than the latest mosaic.
+        max_native_zoom=17,
+    ).add_to(map_object)
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="Street map",
+        overlay=False,
+        control=True,
+        show=False,
+    ).add_to(map_object)
+    folium.TileLayer(
+        tiles=ESRI_REFERENCE_TILES,
+        attr=(
+            "Esri, HERE, Garmin, OpenStreetMap contributors, "
+            "and the GIS User Community"
+        ),
+        name="Place labels",
+        overlay=True,
+        control=True,
+        show=False,
+        max_zoom=21,
+    ).add_to(map_object)
+
+    legend_html = """
+    <div style="
+        position: fixed;
+        left: 14px;
+        bottom: 28px;
+        z-index: 9999;
+        background: rgba(15, 23, 42, 0.90);
+        color: white;
+        padding: 9px 11px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0,0,0,.3);
+        font: 12px/1.35 sans-serif;
+        pointer-events: none;">
+      <div><span style="color:#1261ff;font-size:18px;">&#9679;</span>
+        GPS track</div>
+      <div><span style="color:#ffb000;font-size:18px;">&#9679;</span>
+        Candidate time range</div>
+      <div><span style="color:#22d3ee;font-size:18px;">&#9679;</span>
+        GPS logging start</div>
+      <div style="opacity:.78;margin-top:3px;">Layers: top right</div>
+    </div>
+    """
+    map_object.get_root().html.add_child(folium.Element(legend_html))
+
+
+def _add_gps_session_start_layer(
+    map_object,
+    gps_df,
+    timezone_str,
+    max_gap_seconds=30,
+):
+    """Mark each contiguous GPS logging interval without calling it a launch."""
+    timed_gps = _timed_gps_df(gps_df)
+    if timed_gps.empty:
+        return 0
+    if not timed_gps.index.is_monotonic_increasing:
+        timed_gps.sort_index(inplace=True)
+
+    time_deltas = timed_gps.index.to_series().diff().dt.total_seconds()
+    start_positions = np.flatnonzero(
+        time_deltas.isna().to_numpy()
+        | (time_deltas.to_numpy() > float(max_gap_seconds))
+    )
+    session_group = folium.FeatureGroup(
+        name="GPS Logging Starts",
+        show=True,
+        overlay=True,
+    ).add_to(map_object)
+
+    for session_number, row_position in enumerate(start_positions, start=1):
+        timestamp = timed_gps.index[row_position]
+        row = timed_gps.iloc[row_position]
+        local_time = _format_map_gps_timestamp(timestamp, timezone_str)
+        folium.CircleMarker(
+            location=[float(row["latitude"]), float(row["longitude"])],
+            radius=9,
+            color="#22d3ee",
+            weight=3,
+            fill=True,
+            fill_color="#0f172a",
+            fill_opacity=0.75,
+            tooltip=f"GPS logging interval {session_number} starts",
+            popup=folium.Popup(
+                f"<b>GPS logging interval {session_number}</b><br>"
+                f"Start: {html.escape(local_time)}<br>"
+                "This is the logging start, not necessarily the water entry.",
+                max_width=300,
+            ),
+        ).add_to(session_group)
+    return len(start_positions)
 
 
 def _gps_time_missing_count(gps_df):
@@ -89,6 +256,327 @@ def _gps_index_is_utc_or_time_missing(index):
 
 def _gps_timestamp_identified(timestamp):
     return isinstance(timestamp, pd.Timestamp) and pd.notna(timestamp)
+
+
+def _correct_media_timestamp_utc(
+    media_time_naive,
+    time_offset,
+    timezone_str,
+    interpret_media_time_as_local=False,
+):
+    if interpret_media_time_as_local:
+        media_timezone = pytz.timezone(timezone_str)
+        media_time_aware = media_timezone.localize(media_time_naive, is_dst=None)
+        return media_time_aware.astimezone(pytz.utc) + time_offset
+    return pytz.utc.localize(media_time_naive + time_offset)
+
+
+def _format_map_gps_timestamp(timestamp, timezone_str):
+    timestamp_value = pd.Timestamp(timestamp)
+    if timestamp_value.tzinfo is None:
+        timestamp_value = timestamp_value.tz_localize('UTC')
+    try:
+        local_timestamp = timestamp_value.tz_convert(timezone_str)
+        display_timezone = timezone_str
+    except (KeyError, ValueError, pytz.UnknownTimeZoneError):
+        local_timestamp = timestamp_value.tz_convert('UTC')
+        display_timezone = 'UTC'
+    return (
+        local_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        + f' ({display_timezone})'
+    )
+
+
+def _safe_inline_json(value):
+    """Serialize data for an inline script without allowing HTML termination."""
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+        .replace('&', '\\u0026')
+        .replace('<', '\\u003c')
+        .replace('>', '\\u003e')
+    )
+
+
+def _gps_parse_cache_key(primary_path, gps_parsing_params):
+    """Return a stable key for inputs that materially affect GPS parsing."""
+    parse_type = gps_parsing_params.get('type', 'gpx')
+
+    def normalized_path(path):
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    if parse_type == 'tlog':
+        paths = gps_parsing_params.get('paths') or [primary_path]
+        # TLOG timestamps are absolute; the display/camera timezone does not
+        # alter the parsed GPS records.
+        return ('tlog', tuple(normalized_path(path) for path in paths))
+    if parse_type == 'gpx':
+        return ('gpx', normalized_path(primary_path))
+
+    # CSV parsing can depend on every mapping and timezone control.
+    relevant_csv_settings = tuple(
+        sorted(
+            (str(key), str(value))
+            for key, value in gps_parsing_params.items()
+            if key != 'paths'
+        )
+    )
+    return ('csv', normalized_path(primary_path), relevant_csv_settings)
+
+
+def _add_compact_gps_marker_layer(
+    map_object,
+    gps_df,
+    timezone_str,
+    cancel_check=None,
+):
+    """Add exact clickable GPS points using one compact JavaScript data layer."""
+    gps_group = folium.FeatureGroup(
+        name="GPS Track (Click for Transect)",
+        show=True,
+        overlay=True,
+    ).add_to(map_object)
+    gps_marker_data = []
+    for row_number, (timestamp, row) in enumerate(gps_df.iterrows()):
+        if row_number % 2048 == 0 and cancel_check and cancel_check():
+            return False
+
+        timestamp_iso = None
+        timestamp_display = None
+        if _gps_timestamp_identified(timestamp):
+            timestamp_iso = timestamp.isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z')
+            timestamp_display = _format_map_gps_timestamp(
+                timestamp,
+                timezone_str,
+            )
+
+        fix_type = row.get('fix_type')
+        fix_type = int(fix_type) if pd.notna(fix_type) else None
+        satellites = row.get('satellites_visible')
+        satellites = int(satellites) if pd.notna(satellites) else None
+        source_file = row.get('source_file')
+        source_file = str(source_file) if pd.notna(source_file) else None
+        gps_marker_data.append(
+            [
+                round(float(row['latitude']), 7),
+                round(float(row['longitude']), 7),
+                timestamp_iso,
+                timestamp_display,
+                fix_type,
+                satellites,
+                source_file,
+            ]
+        )
+
+    marker_data_json = _safe_inline_json(gps_marker_data)
+    group_name = gps_group.get_name()
+    compact_marker_script = f"""
+<script>
+window.addEventListener("DOMContentLoaded", function() {{
+    const gpsData = {marker_data_json};
+    const gpsGroup = {group_name};
+    gpsData.forEach(function(point) {{
+        const hasTime = point[2] !== null;
+        const marker = L.circleMarker([point[0], point[1]], {{
+            radius: 4,
+            color: hasTime ? "#1261ff" : "gray",
+            weight: 1,
+            fill: true,
+            fillColor: hasTime ? "#1261ff" : "gray",
+            fillOpacity: 0.6,
+            customTimestamp: point[2]
+        }});
+
+        const popup = document.createElement("div");
+        const title = document.createElement("b");
+        title.textContent = "GPS Point";
+        popup.appendChild(title);
+        const addLine = function(label, value) {{
+            if (value === null || value === "") return null;
+            const line = document.createElement("div");
+            line.textContent = label + value;
+            popup.appendChild(line);
+            return line;
+        }};
+        if (hasTime) {{
+            marker._gpsTimestampLine = addLine("Time: ", point[3]);
+        }} else {{
+            const missing = document.createElement("b");
+            missing.textContent = "{GPS_TIME_NOT_IDENTIFIED}";
+            popup.appendChild(document.createElement("br"));
+            popup.appendChild(missing);
+        }}
+        addLine("Lat: ", point[0].toFixed(7));
+        addLine("Lon: ", point[1].toFixed(7));
+        addLine("GPS fix type: ", point[4]);
+        addLine("Satellites: ", point[5]);
+        addLine("Source: ", point[6]);
+
+        if (hasTime) {{
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = "Select This Point";
+            button.addEventListener("click", function(event) {{
+                event.stopPropagation();
+                if (window.pyHandler && window.pyHandler.handleGpsPointClick) {{
+                    window.pyHandler.handleGpsPointClick(
+                        point[2],
+                        event.ctrlKey,
+                        event.shiftKey
+                    );
+                }}
+            }});
+            popup.appendChild(button);
+            marker.bindTooltip("Click to open: " + point[3]);
+            marker.on("click", function(event) {{
+                const original = event.originalEvent || {{}};
+                if (window.pyHandler && window.pyHandler.handleGpsPointClick) {{
+                    window.pyHandler.handleGpsPointClick(
+                        point[2],
+                        Boolean(original.ctrlKey),
+                        Boolean(original.shiftKey)
+                    );
+                }}
+            }});
+        }} else {{
+            marker.bindTooltip("{GPS_TIME_NOT_IDENTIFIED}");
+        }}
+        marker.bindPopup(popup, {{maxWidth: 280}});
+        marker.addTo(gpsGroup);
+    }});
+}});
+
+function formatGpsTimestampForZone(timestampIso, timezoneName) {{
+    const value = new Date(timestampIso);
+    if (!Number.isFinite(value.getTime())) return null;
+    try {{
+        const parts = new Intl.DateTimeFormat("en-CA", {{
+            timeZone: timezoneName,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            fractionalSecondDigits: 3,
+            hourCycle: "h23"
+        }}).formatToParts(value);
+        const part = function(type) {{
+            const match = parts.find(function(item) {{ return item.type === type; }});
+            return match ? match.value : "";
+        }};
+        return part("year") + "-" + part("month") + "-" + part("day")
+            + " " + part("hour") + ":" + part("minute") + ":" + part("second")
+            + "." + part("fractionalSecond") + " (" + timezoneName + ")";
+    }} catch (error) {{
+        return null;
+    }}
+}}
+
+function updateMapTimezone(timezoneName) {{
+    const map = Object.values(window).find(function(value) {{
+        return value instanceof L.Map;
+    }});
+    if (!map) return 0;
+    let updated = 0;
+    map.eachLayer(function(layer) {{
+        if (!layer.options || !layer.options.customTimestamp) return;
+        const display = formatGpsTimestampForZone(
+            layer.options.customTimestamp,
+            timezoneName
+        );
+        if (!display) return;
+        if (layer._gpsTimestampLine) {{
+            layer._gpsTimestampLine.textContent = "Time: " + display;
+        }}
+        const tooltip = layer.getTooltip ? layer.getTooltip() : null;
+        if (tooltip) tooltip.setContent("Click to open: " + display);
+        updated += 1;
+    }});
+    return updated;
+}}
+</script>
+"""
+    map_object.get_root().html.add_child(folium.Element(compact_marker_script))
+    return True
+
+
+def _add_compact_image_marker_layer(
+    map_object,
+    results_df,
+    cancel_check=None,
+):
+    """Add clustered image points from one compact JavaScript data array."""
+    image_cluster = folium.plugins.MarkerCluster(
+        name="Images",
+        show=True,
+        overlay=True,
+    ).add_to(map_object)
+    image_marker_data = []
+    columns = ['Latitude', 'Longitude', 'TS_dt', 'Identifier']
+    for row_number, (latitude, longitude, timestamp, identifier) in enumerate(
+        results_df[columns].itertuples(index=False, name=None)
+    ):
+        if row_number % 2048 == 0 and cancel_check and cancel_check():
+            return False
+        timestamp_display = "N/A"
+        if pd.notna(timestamp):
+            timestamp_value = pd.Timestamp(timestamp)
+            if timestamp_value.tzinfo is None:
+                timestamp_value = timestamp_value.tz_localize('UTC')
+            else:
+                timestamp_value = timestamp_value.tz_convert('UTC')
+            timestamp_display = (
+                timestamp_value.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                + ' UTC'
+            )
+        image_marker_data.append(
+            [
+                round(float(latitude), 7),
+                round(float(longitude), 7),
+                str(identifier),
+                timestamp_display,
+            ]
+        )
+
+    marker_data_json = _safe_inline_json(image_marker_data)
+    cluster_name = image_cluster.get_name()
+    compact_marker_script = f"""
+<script>
+window.addEventListener("DOMContentLoaded", function() {{
+    const imageData = {marker_data_json};
+    const imageCluster = {cluster_name};
+    imageData.forEach(function(point) {{
+        const popup = document.createElement("div");
+        const addLine = function(label, value) {{
+            const line = document.createElement("div");
+            line.textContent = label + value;
+            popup.appendChild(line);
+        }};
+        addLine("ID: ", point[2]);
+        addLine("Time: ", point[3]);
+        addLine("Lat: ", point[0].toFixed(7));
+        addLine("Lon: ", point[1].toFixed(7));
+
+        L.circleMarker([point[0], point[1]], {{
+            radius: 4,
+            color: "red",
+            weight: 1,
+            fill: true,
+            fillColor: "red",
+            fillOpacity: 0.7
+        }})
+        .bindPopup(popup, {{maxWidth: 300}})
+        .bindTooltip("Img: " + point[2])
+        .addTo(imageCluster);
+    }});
+}});
+</script>
+"""
+    map_object.get_root().html.add_child(folium.Element(compact_marker_script))
+    return True
+
 
 # --- Set up logging for GUI ---
 class QTextEditLogger(logging.Handler):
@@ -120,6 +608,17 @@ class MapInteractionHandler(QObject):
         self.log(f"Handler emitting signal for: {timestamp_str_iso}", logging.DEBUG)
         self.gpsPointClicked.emit(timestamp_str_iso, ctrl_pressed, shift_pressed)
 
+
+class NoWheelComboBox(QComboBox):
+    """A combo box that cannot be changed accidentally while scrolling a form."""
+
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class WorkerThread(QThread):
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
@@ -127,15 +626,32 @@ class WorkerThread(QThread):
     error_occurred = pyqtSignal(str)
     map_ready = pyqtSignal(str)
 
-    def __init__(self, gps_path, gps_parsing_params, media_path, media_type, frame_interval, sync_method, sync_params):
+    def __init__(
+        self,
+        gps_path,
+        gps_parsing_params,
+        media_path,
+        media_type,
+        sync_method,
+        sync_params,
+        folder_time_offsets=None,
+        preloaded_gps_df=None,
+        preloaded_media_items=None,
+    ):
         super().__init__()
         self.gps_path = gps_path
         self.gps_parsing_params = gps_parsing_params
         self.media_path = media_path
         self.media_type = media_type
-        self.frame_interval = frame_interval
         self.sync_method = sync_method
         self.sync_params = sync_params
+        self.folder_time_offsets = dict(folder_time_offsets or {})
+        self.preloaded_gps_df = preloaded_gps_df
+        self.preloaded_media_items = (
+            list(preloaded_media_items)
+            if preloaded_media_items is not None
+            else None
+        )
         self.results_df = None
         self.original_media_list = []
         self.map_file = None
@@ -147,6 +663,9 @@ class WorkerThread(QThread):
         log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} - {logging.getLevelName(level)} - [Worker] {message}"
         self.log_message.emit(log_entry)
 
+    def stop_requested(self):
+        return self.isInterruptionRequested()
+
     def run(self):
         gps_df_final = None
         if not ENGINE_AVAILABLE:
@@ -156,18 +675,62 @@ class WorkerThread(QThread):
         try:
             self.log("Worker thread started.")
             self.progress.emit(5)
+            if self.stop_requested():
+                self.log("Processing cancelled before GPS parsing.", logging.INFO)
+                return
 
             self.log("Step 1: Loading GPS data...")
             gps_df = None
             parse_type = self.gps_parsing_params.get('type', 'gpx')
             tz_str = self.gps_parsing_params.get('boat_timezone', 'UTC')
 
-            if parse_type == 'gpx':
+            if self.preloaded_gps_df is not None:
+                gps_df = self.preloaded_gps_df.copy(deep=False)
+                self.log(
+                    f"Reusing validated preliminary GPS data "
+                    f"({len(gps_df):,} points)."
+                )
+            elif parse_type == 'gpx':
                 try:
                     gps_df = engine.parse_gpx_file(self.gps_path)
                 except Exception as e:
                     err_msg = f"Failed to parse GPX: {e}"
                     self.log(err_msg, logging.ERROR)
+                    self.error_occurred.emit(err_msg)
+                    return
+            elif parse_type == 'tlog':
+                try:
+                    tlog_paths = self.gps_parsing_params.get('paths') or [self.gps_path]
+                    self.log(f"Parsing {len(tlog_paths)} MAVLink TLOG file(s).")
+                    gps_df = engine.parse_mavlink_tlog_files(
+                        tlog_paths,
+                        cancel_check=self.stop_requested,
+                    )
+                    source_types = gps_df.attrs.get('source_message_types', {})
+                    self.log(
+                        f"TLOG import scanned {gps_df.attrs.get('tlog_records_scanned', 0):,} "
+                        f"MAVLink records; selected position streams: {source_types}."
+                    )
+                    skipped_files = gps_df.attrs.get('skipped_files', [])
+                    if skipped_files:
+                        self.log(
+                            "Skipped TLOG file(s) with no valid GPS positions: "
+                            + ", ".join(os.path.basename(path) for path in skipped_files),
+                            logging.WARNING,
+                        )
+                    duplicate_rows = int(gps_df.attrs.get('duplicate_timestamp_rows', 0))
+                    if duplicate_rows:
+                        self.log(
+                            f"Removed {duplicate_rows} duplicate TLOG timestamp(s) while merging files.",
+                            logging.INFO,
+                        )
+                except InterruptedError:
+                    self.log("TLOG parsing cancelled.", logging.INFO)
+                    return
+                except Exception as e:
+                    err_msg = f"Failed to parse TLOG: {e}"
+                    self.log(err_msg, logging.ERROR)
+                    self.log(traceback.format_exc(), logging.DEBUG)
                     self.error_occurred.emit(err_msg)
                     return
             elif parse_type == 'csv':
@@ -215,6 +778,12 @@ class WorkerThread(QThread):
                 self.log("GPS data is empty after parsing.", logging.WARNING)
             else:
                 self.log(f"GPS data loaded: {len(gps_df)} points.")
+                invalid_coordinate_rows = int(gps_df.attrs.get('invalid_coordinate_rows', 0))
+                if invalid_coordinate_rows:
+                    self.log(
+                        f"Ignored {invalid_coordinate_rows} GPS row(s) with missing or out-of-range coordinates.",
+                        logging.WARNING,
+                    )
                 if not all(col in gps_df.columns for col in ['latitude', 'longitude']):
                     err_msg = "GPS data missing required 'latitude' or 'longitude' columns."
                     self.log(err_msg, logging.ERROR)
@@ -256,14 +825,27 @@ class WorkerThread(QThread):
 
             gps_df_final = gps_df
             self.progress.emit(15)
+            if self.stop_requested():
+                self.log("Processing cancelled after GPS parsing.", logging.INFO)
+                return
 
             self.log("Step 2: Loading image files...")
             media_items = []
             self.original_media_list = []
-            if self.media_path and self.media_type == 'images':
+            if self.preloaded_media_items is not None:
+                media_items = list(self.preloaded_media_items)
+                self.original_media_list = media_items
+                self.log(
+                    f"Reusing validated preliminary image scan "
+                    f"({len(media_items):,} images)."
+                )
+            elif self.media_path and self.media_type == 'images':
                 self.log(f"Scanning image dir: {self.media_path}")
                 try:
-                    media_items = engine.get_image_files_and_times(self.media_path)
+                    media_items = engine.get_image_files_and_times(
+                        self.media_path,
+                        cancel_check=self.stop_requested,
+                    )
                     self.original_media_list = media_items
                 except Exception as e:
                     self.log(f"Error scanning images: {e}", logging.ERROR)
@@ -272,6 +854,9 @@ class WorkerThread(QThread):
             else:
                 self.log(f"Found {len(media_items)} images.", logging.INFO)
             self.progress.emit(30)
+            if self.stop_requested():
+                self.log("Processing cancelled during image scanning.", logging.INFO)
+                return
 
             self.log("Step 3: Calculating time offset...")
             time_offset = timedelta(0)
@@ -281,6 +866,12 @@ class WorkerThread(QThread):
                 try:
                     time_offset = engine.calculate_time_offset(self.sync_method, **sync_params_with_tz)
                     self.log(f"Time offset calculated: {time_offset}")
+                    if self.folder_time_offsets:
+                        formatted_offsets = ", ".join(
+                            f"{group}={offset:+.3f}s"
+                            for group, offset in sorted(self.folder_time_offsets.items())
+                        )
+                        self.log(f"Using per-folder camera offsets: {formatted_offsets}")
                 except ValueError as e:
                     err_msg = f"Offset calc error: {e}"
                     self.log(err_msg, logging.ERROR)
@@ -302,16 +893,44 @@ class WorkerThread(QThread):
             total_items = len(media_items)
             if not media_items:
                 self.log("No images to georeference.")
-                self.results_df = pd.DataFrame(columns=['Identifier', 'File Path', 'Original Timestamp', 'Corrected Timestamp (UTC)', 'Latitude', 'Longitude'])
+                self.results_df = pd.DataFrame(
+                    columns=[
+                        'Identifier',
+                        'File Path',
+                        'Camera Group',
+                        'Applied Offset (seconds)',
+                        'Original Timestamp',
+                        'Corrected Timestamp (UTC)',
+                        'Latitude',
+                        'Longitude',
+                    ]
+                )
             else:
                 media_data_tz_obj = pytz.timezone(tz_str)
+                if parse_type == 'tlog':
+                    self.log(
+                        f"Interpreting camera EXIF timestamps as laptop-local time in "
+                        f"{tz_str}, then converting them to UTC for TLOG matching."
+                    )
                 gps_df_for_interp = _timed_gps_df(gps_df_final)
                 valid_gps_for_interp = gps_df_for_interp is not None and not gps_df_for_interp.empty
 
+                last_progress = -1
                 for i, item in enumerate(media_items):
+                    if self.stop_requested():
+                        self.log("Processing cancelled during image georeferencing.", logging.INFO)
+                        return
                     lat, lon = None, None
                     id_val = item.get('identifier', f'Item_{i}')
                     fp = item.get('file_path', 'N/A')
+                    time_group = item.get('time_group', '.')
+                    applied_offset_seconds = float(
+                        self.folder_time_offsets.get(
+                            time_group,
+                            time_offset.total_seconds(),
+                        )
+                    )
+                    item_time_offset = timedelta(seconds=applied_offset_seconds)
                     orig_ts_naive = item.get('image_time')
                     orig_disp = "N/A"
                     corr_utc_iso = "N/A"
@@ -325,8 +944,12 @@ class WorkerThread(QThread):
                                 self.log(f"Error formatting original time display {orig_ts_naive} for {id_val}: {disp_err}", logging.WARNING)
                                 orig_disp = orig_ts_naive.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + " (Naive, Format Error)"
 
-                            corr_naive = orig_ts_naive + time_offset
-                            corr_utc = pytz.utc.localize(corr_naive)
+                            corr_utc = _correct_media_timestamp_utc(
+                                orig_ts_naive,
+                                item_time_offset,
+                                tz_str,
+                                interpret_media_time_as_local=(parse_type == 'tlog'),
+                            )
                             corr_utc_iso = corr_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
                             if valid_gps_for_interp:
@@ -350,7 +973,11 @@ class WorkerThread(QThread):
                             skipped_interpolation_count += 1
 
                         georeferenced_data.append({
-                            'Identifier': id_val, 'File Path': fp, 'Original Timestamp': orig_disp,
+                            'Identifier': id_val,
+                            'File Path': fp,
+                            'Camera Group': time_group,
+                            'Applied Offset (seconds)': applied_offset_seconds,
+                            'Original Timestamp': orig_disp,
                             'Corrected Timestamp (UTC)': corr_utc_iso if corr_utc_iso != "N/A" else pd.NA,
                             'Latitude': lat if pd.notna(lat) else np.nan,
                             'Longitude': lon if pd.notna(lon) else np.nan
@@ -358,11 +985,17 @@ class WorkerThread(QThread):
                     except Exception as e:
                         self.log(f"Error processing media item '{id_val}': {e}", logging.ERROR)
                         georeferenced_data.append({
-                            'Identifier': id_val, 'File Path': fp, 'Original Timestamp': 'ERROR',
+                            'Identifier': id_val,
+                            'File Path': fp,
+                            'Camera Group': time_group,
+                            'Applied Offset (seconds)': applied_offset_seconds,
+                            'Original Timestamp': 'ERROR',
                             'Corrected Timestamp (UTC)': 'ERROR', 'Latitude': np.nan, 'Longitude': np.nan
                         })
                     prog = int(40 + (i + 1) / total_items * 55) if total_items > 0 else 95
-                    self.progress.emit(prog)
+                    if prog != last_progress:
+                        self.progress.emit(prog)
+                        last_progress = prog
 
                 self.results_df = pd.DataFrame(georeferenced_data)
                 if 'Corrected Timestamp (UTC)' in self.results_df.columns:
@@ -370,18 +1003,31 @@ class WorkerThread(QThread):
                         self.results_df['Corrected Timestamp (UTC)'].astype(str).str.replace('Z','+00:00', regex=False),
                         errors='coerce', utc=True
                     )
-                if 'Altitude' in self.results_df.columns:
-                    self.results_df.drop(columns=['Altitude'], inplace=True, errors='ignore')
                 if skipped_interpolation_count > 0:
                     self.log(f"{skipped_interpolation_count} items could not be georeferenced.", logging.WARNING)
             self.log("Image georeferencing complete.")
 
+            if self.stop_requested():
+                self.log("Processing cancelled before publishing results.", logging.INFO)
+                return
             self.final_gps_df_for_app = gps_df_final
             self.results_ready.emit(self.results_df, self.original_media_list, gps_df_final)
             self.progress.emit(95)
 
             self.log("Step 5: Generating initial map...")
+            if self.stop_requested():
+                self.log("Processing cancelled before map generation.", logging.INFO)
+                return
             self.map_file = self.generate_combined_map(gps_df_final, self.results_df)
+            if self.stop_requested():
+                if self.map_file and os.path.exists(self.map_file):
+                    try:
+                        os.remove(self.map_file)
+                    except OSError as remove_error:
+                        self.log(f"Could not remove cancelled map: {remove_error}", logging.WARNING)
+                self.map_file = None
+                self.log("Processing cancelled after map generation.", logging.INFO)
+                return
             if self.map_file and os.path.exists(self.map_file):
                 self.map_ready.emit(self.map_file)
                 self.log("Initial map generated.")
@@ -481,11 +1127,15 @@ class WorkerThread(QThread):
 
         map_path = None
         try:
-            m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap", control_scale=True)
-            folium.TileLayer(
-                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                attr='Tiles © Esri', name='Esri Satellite', overlay=False, control=True
-            ).add_to(m)
+            m = folium.Map(
+                location=center,
+                zoom_start=zoom,
+                tiles=None,
+                control_scale=True,
+                prefer_canvas=True,
+                max_zoom=21,
+            )
+            _add_imagery_basemaps(m)
 
             js_code = """
             <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
@@ -511,14 +1161,50 @@ function highlightTransectRange(timestamps) {
         if (layer.options && layer.options.customTimestamp) { // Check if it's a GPS point marker
             var isHl = timestamps.indexOf(layer.options.customTimestamp) !== -1;
             layer.setStyle({
-                color: isHl? 'lime':'blue', // Highlighted vs default GPS point color
-                fillColor: isHl? 'lime':'blue',
+                color: isHl? 'lime':'#1261ff', // Highlighted vs default GPS point color
+                fillColor: isHl? 'lime':'#1261ff',
                 fillOpacity: isHl? 0.9:0.6,
                 weight: isHl? 3:1 // Thicker if highlighted
             });
             if (layer.setRadius) layer.setRadius(isHl? 6:4); // Larger if highlighted
         }
     });
+}
+function focusGpsTimeWindow(startIso, endIso) {
+    var map = Object.values(window).find(x => x instanceof L.Map);
+    if (!map) return 0;
+    var startMs = Date.parse(startIso);
+    var endMs = Date.parse(endIso);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return 0;
+    var lowerMs = Math.min(startMs, endMs);
+    var upperMs = Math.max(startMs, endMs);
+    var candidateBounds = [];
+    map.eachLayer(function(layer) {
+        if (layer.options && layer.options.customTimestamp) {
+            var pointMs = Date.parse(layer.options.customTimestamp);
+            var isCandidate = Number.isFinite(pointMs)
+                && pointMs >= lowerMs && pointMs <= upperMs;
+            layer.setStyle({
+                color: isCandidate ? '#ffb000' : '#1261ff',
+                fillColor: isCandidate ? '#ffb000' : '#1261ff',
+                fillOpacity: isCandidate ? 0.95 : 0.48,
+                weight: isCandidate ? 3 : 1
+            });
+            if (layer.setRadius) layer.setRadius(isCandidate ? 6 : 4);
+            if (isCandidate && layer.getLatLng) {
+                candidateBounds.push(layer.getLatLng());
+            }
+        }
+    });
+    if (candidateBounds.length === 1) {
+        map.setView(candidateBounds[0], 18);
+    } else if (candidateBounds.length > 1) {
+        map.fitBounds(L.latLngBounds(candidateBounds), {
+            padding: [48, 48],
+            maxZoom: 18
+        });
+    }
+    return candidateBounds.length;
 }
 // This now only handles the temporary YELLOW line during definition
 function drawTransectLine(lat1, lon1, lat2, lon2) {
@@ -529,7 +1215,7 @@ function drawTransectLine(lat1, lon1, lat2, lon2) {
     }
     window.transectLine = L.polyline([[lat1, lon1], [lat2, lon2]], { color: 'yellow', weight: 2, interactive: false }).addTo(map);
 }
-// NEW FUNCTION (this was the missing one): Draws a permanent ORANGE line for a saved transect
+// Draw a permanent orange line for a saved transect.
 function drawSavedTransectLine(lat1, lon1, lat2, lon2, name) {
     var map = Object.values(window).find(x => x instanceof L.Map);
     if (!map) return;
@@ -605,68 +1291,42 @@ function clearAllSavedTransectLines() {
 
 
             if has_valid_gps:
-                gps_group = folium.FeatureGroup(
-                    name="GPS Track (Click for Transect)",
-                    show=True,
-                    overlay=True
-                ).add_to(m)
-                for _, (ts, row) in enumerate(valid_gps_df.iterrows()):
-                    marker_options = {}
-                    marker_color = 'blue'
-                    marker_fill = 'blue'
-                    tooltip = GPS_TIME_NOT_IDENTIFIED
-                    if _gps_timestamp_identified(ts):
-                        ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-                        ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
-                        js_call = (
-                            f"sendClickedGpsTimestampToPython('{ts_iso}', event.ctrlKey, event.shiftKey); "
-                            "var m=null;for(var k in window){if(window[k] instanceof L.Map){m=window[k];break;}} "
-                            "if(m){m.closePopup();};"
-                        )
-                        escaped_js = js_call.replace('"', '&quot;')
-                        popup_html = (
-                            f'<b>GPS Point</b><br>'
-                            f'Time: {ts_tip}<br>'
-                            f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                            f'<button type="button" onclick="{escaped_js}">Select This Point</button>'
-                        )
-                        tooltip = f"Click to open: {ts_tip}"
-                        marker_options = {'customTimestamp': ts_iso}
-                    else:
-                        marker_color = 'gray'
-                        marker_fill = 'gray'
-                        popup_html = (
-                            f'<b>GPS Point</b><br>'
-                            f'<b>{GPS_TIME_NOT_IDENTIFIED}</b><br>'
-                            f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                            'This point cannot be used for time-based transects.'
-                        )
-                    folium.CircleMarker(
-                        location=[row['latitude'], row['longitude']],
-                        radius=4,
-                        color=marker_color,
-                        weight=1,
-                        fill=True,
-                        fill_color=marker_fill,
-                        fill_opacity=0.6,
-                        popup=folium.Popup(popup_html, max_width=250),
-                        tooltip=tooltip,
-                        options=marker_options
-                    ).add_to(gps_group)
+                marker_layer_added = _add_compact_gps_marker_layer(
+                    m,
+                    valid_gps_df,
+                    self.gps_parsing_params.get('boat_timezone', 'UTC'),
+                    cancel_check=self.stop_requested,
+                )
+                if not marker_layer_added:
+                    self.log("[Worker] Map generation cancelled.", logging.INFO)
+                    return None
+                _add_gps_session_start_layer(
+                    m,
+                    valid_gps_df,
+                    self.gps_parsing_params.get('boat_timezone', 'UTC'),
+                )
             if has_valid_results:
-                img_cluster = folium.plugins.MarkerCluster(name="Images", show=True, overlay=True).add_to(m)
-                for _, row_res in valid_results_df.iterrows():
-                    ts_utc_res = row_res['TS_dt']
-                    pop = f"ID: {row_res['Identifier']}<br>Time: {ts_utc_res.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ' UTC' if pd.notna(ts_utc_res) else 'N/A'}<br>Lat: {row_res['Latitude']:.7f}, Lon: {row_res['Longitude']:.7f}"
-                    folium.CircleMarker(location=[row_res['Latitude'], row_res['Longitude']], radius=4, color='red', weight=1, fill=True,
-                                        fill_color='red', fill_opacity=0.7, popup=folium.Popup(pop, max_width=300),
-                                        tooltip=f"Img: {row_res['Identifier']}").add_to(img_cluster)
+                marker_layer_added = _add_compact_image_marker_layer(
+                    m,
+                    valid_results_df,
+                    cancel_check=self.stop_requested,
+                )
+                if not marker_layer_added:
+                    self.log("[Worker] Map generation cancelled.", logging.INFO)
+                    return None
 
             folium.LayerControl().add_to(m)
             fd, map_path_temp = tempfile.mkstemp(suffix=".html", prefix="geotagger_map_worker_")
             os.close(fd)
             map_path = map_path_temp
             m.save(map_path)
+            if self.stop_requested():
+                try:
+                    os.remove(map_path)
+                except OSError as remove_error:
+                    self.log(f"[Worker] Could not remove cancelled map: {remove_error}", logging.WARNING)
+                self.log("[Worker] Map generation cancelled after serialization.", logging.INFO)
+                return None
             self.log(f"[Worker] Map saved to temporary file: {map_path}")
             return map_path
         except Exception as e:
@@ -679,12 +1339,256 @@ function clearAllSavedTransectLines() {
                     self.log(f"[Worker] Error removing partial map file: {rm_err}", logging.WARNING)
             return None
 
+
+class SequenceReviewDialog(QDialog):
+    """Review a small camera sequence and choose a frame for Visual Sync."""
+
+    def __init__(
+        self,
+        media_items,
+        time_group,
+        timezone_str,
+        offset_analysis=None,
+        display_name=None,
+        parent=None,
+        page_size=12,
+    ):
+        super().__init__(parent)
+        self.media_items = sorted(
+            media_items,
+            key=lambda item: item.get('image_time') or datetime.max,
+        )
+        self.time_group = time_group
+        self.display_name = display_name or time_group
+        self.timezone_str = timezone_str
+        self.offset_analysis = offset_analysis or {}
+        self.page_size = page_size
+        self.page_start = 0
+        self.selected_item = None
+        self.thumbnail_buttons = {}
+
+        self.setWindowTitle(f"Review First Photos — {self.display_name}")
+        self.setModal(True)
+        self.resize(1160, 720)
+        self.setMinimumSize(900, 620)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(10)
+
+        heading = QLabel(f"Review the beginning of “{self.display_name}”")
+        heading.setObjectName("dialogHeading")
+        root_layout.addWidget(heading)
+
+        suggested = self.offset_analysis.get('suggested_offset_seconds')
+        range_min = self.offset_analysis.get('best_offset_min_seconds')
+        range_max = self.offset_analysis.get('best_offset_max_seconds')
+        if suggested is not None and range_min is not None and range_max is not None:
+            timing_summary = (
+                f"Suggested offset {suggested:+d} s  •  equally valid range "
+                f"{range_min:+d} to {range_max:+d} s"
+            )
+        else:
+            timing_summary = "No offset analysis is available for this folder yet."
+        context_label = QLabel(
+            timing_summary
+            + "\nChoose the first frame that clearly places the boat in the water, "
+              "then use it for Visual Sync and click that same event on the map."
+        )
+        context_label.setObjectName("sectionIntro")
+        context_label.setWordWrap(True)
+        root_layout.addWidget(context_label)
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(12)
+        self.photo_scroll = QScrollArea()
+        self.photo_scroll.setWidgetResizable(True)
+        self.photo_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.photo_container = QWidget()
+        self.photo_grid = QGridLayout(self.photo_container)
+        self.photo_grid.setContentsMargins(4, 4, 4, 4)
+        self.photo_grid.setHorizontalSpacing(8)
+        self.photo_grid.setVerticalSpacing(8)
+        self.photo_scroll.setWidget(self.photo_container)
+        content_layout.addWidget(self.photo_scroll, 1)
+
+        preview_panel = QFrame()
+        preview_panel.setObjectName("previewPanel")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(12, 12, 12, 12)
+        preview_title = QLabel("Selected frame")
+        preview_title.setObjectName("previewTitle")
+        preview_layout.addWidget(preview_title)
+        self.large_preview = QLabel("Select a thumbnail")
+        self.large_preview.setObjectName("largePreview")
+        self.large_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.large_preview.setMinimumSize(300, 230)
+        preview_layout.addWidget(self.large_preview)
+        self.selected_details = QLabel(
+            "The image filename and local camera timestamp will appear here."
+        )
+        self.selected_details.setObjectName("helperText")
+        self.selected_details.setWordWrap(True)
+        preview_layout.addWidget(self.selected_details)
+        preview_layout.addStretch()
+        content_layout.addWidget(preview_panel)
+        root_layout.addLayout(content_layout, 1)
+
+        navigation_layout = QHBoxLayout()
+        self.previous_button = QPushButton("Previous 12")
+        self.previous_button.clicked.connect(self._previous_page)
+        navigation_layout.addWidget(self.previous_button)
+        self.page_label = QLabel()
+        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        navigation_layout.addWidget(self.page_label, 1)
+        self.next_button = QPushButton("Next 12")
+        self.next_button.clicked.connect(self._next_page)
+        navigation_layout.addWidget(self.next_button)
+        root_layout.addLayout(navigation_layout)
+
+        footer_layout = QHBoxLayout()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        footer_layout.addWidget(close_button)
+        footer_layout.addStretch()
+        self.use_selected_button = QPushButton(
+            "Use Selected Photo for Visual Sync"
+        )
+        self.use_selected_button.setObjectName("primaryAction")
+        self.use_selected_button.setEnabled(False)
+        self.use_selected_button.clicked.connect(self._accept_selected)
+        footer_layout.addWidget(self.use_selected_button)
+        root_layout.addLayout(footer_layout)
+
+        self._render_page()
+
+    def _camera_time_text(self, item):
+        image_time = item.get('image_time')
+        if isinstance(image_time, datetime):
+            return (
+                image_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                + f" ({self.timezone_str})"
+            )
+        return "Timestamp unavailable"
+
+    def _clear_photo_grid(self):
+        while self.photo_grid.count():
+            layout_item = self.photo_grid.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _render_page(self):
+        self._clear_photo_grid()
+        self.thumbnail_buttons = {}
+        self.thumbnail_button_group = QButtonGroup(self)
+        self.thumbnail_button_group.setExclusive(True)
+
+        page_items = self.media_items[
+            self.page_start:self.page_start + self.page_size
+        ]
+        for page_index, item in enumerate(page_items):
+            sequence_index = self.page_start + page_index
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+            )
+            button.setMinimumSize(170, 148)
+            button.setMaximumSize(194, 172)
+            button.setText(
+                f"{sequence_index + 1}. "
+                f"{os.path.basename(item.get('file_path', 'Unknown'))}\n"
+                f"{self._camera_time_text(item).split(' (')[0].split(' ')[-1]}"
+            )
+            pixmap = QPixmap(item.get('file_path', ''))
+            if not pixmap.isNull():
+                button.setIcon(
+                    QIcon(
+                        pixmap.scaled(
+                            160,
+                            98,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                )
+                button.setIconSize(QSize(160, 98))
+            else:
+                button.setText(button.text() + "\nPreview unavailable")
+            button.setToolTip(
+                f"{item.get('file_path', '')}\n{self._camera_time_text(item)}"
+            )
+            button.clicked.connect(
+                lambda _checked=False, selected=item: self._select_item(selected)
+            )
+            self.thumbnail_button_group.addButton(button)
+            self.thumbnail_buttons[id(item)] = button
+            self.photo_grid.addWidget(button, page_index // 4, page_index % 4)
+
+        for column in range(4):
+            self.photo_grid.setColumnStretch(column, 1)
+        self.photo_grid.setRowStretch((len(page_items) + 3) // 4, 1)
+
+        total = len(self.media_items)
+        page_end = min(self.page_start + len(page_items), total)
+        self.page_label.setText(
+            f"Showing photos {self.page_start + 1:,}–{page_end:,} of {total:,}"
+            if total
+            else "No photos available"
+        )
+        self.previous_button.setEnabled(self.page_start > 0)
+        self.next_button.setEnabled(self.page_start + self.page_size < total)
+        self.photo_scroll.verticalScrollBar().setValue(0)
+
+    def _select_item(self, item):
+        self.selected_item = item
+        selected_button = self.thumbnail_buttons.get(id(item))
+        if selected_button:
+            selected_button.setChecked(True)
+        pixmap = QPixmap(item.get('file_path', ''))
+        if pixmap.isNull():
+            self.large_preview.setPixmap(QPixmap())
+            self.large_preview.setText("Preview unavailable")
+        else:
+            self.large_preview.setText("")
+            self.large_preview.setPixmap(
+                pixmap.scaled(
+                    self.large_preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        self.selected_details.setText(
+            f"<b>{html.escape(os.path.basename(item.get('file_path', 'Unknown')))}</b><br>"
+            f"{html.escape(self._camera_time_text(item))}<br>"
+            f"Sequence photo "
+            f"{self.media_items.index(item) + 1:,} of {len(self.media_items):,}"
+        )
+        self.use_selected_button.setEnabled(True)
+
+    def _previous_page(self):
+        self.page_start = max(0, self.page_start - self.page_size)
+        self._render_page()
+
+    def _next_page(self):
+        if self.page_start + self.page_size < len(self.media_items):
+            self.page_start += self.page_size
+            self._render_page()
+
+    def _accept_selected(self):
+        if self.selected_item is not None:
+            self.accept()
+
+
 class GeoTaggerApp(QWidget):
     PRESET_LENGTH_TOLERANCE_METERS = 0.5
 
     def __init__(self):
         super().__init__()
         self.gps_file_path = None
+        self.gps_file_paths = []
         self.media_path = None
         self.media_type = None
         self.transect_csv_file_path = None
@@ -695,18 +1599,25 @@ class GeoTaggerApp(QWidget):
         self.processed_gps_df = None
         self.preliminary_gps_df = None
         self.preliminary_media_list = []
+        self._preliminary_gps_cache_key = None
+        self._preliminary_media_path = None
         self.sync_image_info = None
         self.sync_gps_point_info = None
+        self.folder_time_offsets = {}
+        self.folder_offset_analysis = {}
 
         self.worker_thread = None
         self.geotag_output_dir_base = "geotagged_images"
         self._map_file_path = None
+        self._stale_temp_map_paths = set()
+        self._awaiting_worker_map = False
+        self._close_when_worker_stops = False
 
         self.transect_definition_mode = None
         self.transect_start_time = None
         self.transect_end_time = None
         self.transect_length_meters = None
-        self.current_timezone_str = "UTC"
+        self.current_timezone_str = DEFAULT_DATA_TIMEZONE
         self.transects_json_dir_name = "transects_json" 
         self.gps_kdtree = None
         self.gps_coordinates_for_kdtree = None
@@ -720,15 +1631,39 @@ class GeoTaggerApp(QWidget):
         self.saved_transects = []
         self.autosave_json_path = None
 
-        self.setWindowTitle(f"GeoTagger - v1.8.5{' (Geopy Disabled)' if not GEOPY_AVAILABLE else ''}")
-        self.setGeometry(100, 100, 1300, 1000)
+        self.setWindowTitle(f"GeoTagger - v1.15.1{' (Geopy Disabled)' if not GEOPY_AVAILABLE else ''}")
+        self.setObjectName("appRoot")
+        self.setMinimumSize(1080, 700)
+        self.resize(1500, 920)
 
-        # --- Main Layout (will contain the splitter) ---
-        self.main_layout = QVBoxLayout(self) # Changed from QHBoxLayout to QVBoxLayout for splitter
+        # --- Application shell ---
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
         self.setLayout(self.main_layout)
 
-        # --- Top layout for inputs and config (will go into left panel of splitter) ---
-        top_layout = QHBoxLayout()
+        self.app_header = QFrame()
+        self.app_header.setObjectName("appHeader")
+        app_header_layout = QHBoxLayout(self.app_header)
+        app_header_layout.setContentsMargins(20, 12, 20, 12)
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(1)
+        app_title = QLabel("GeoTagger")
+        app_title.setObjectName("appTitle")
+        app_subtitle = QLabel("BlueBoat image georeferencing workspace")
+        app_subtitle.setObjectName("appSubtitle")
+        title_layout.addWidget(app_title)
+        title_layout.addWidget(app_subtitle)
+        app_header_layout.addLayout(title_layout)
+        app_header_layout.addStretch()
+        self.header_timezone_label = QLabel(
+            f"Camera time  {self.current_timezone_str}   •   GPS matching  UTC"
+        )
+        self.header_timezone_label.setObjectName("statusPill")
+        app_header_layout.addWidget(self.header_timezone_label)
+        self.main_layout.addWidget(self.app_header)
+
+        # Widgets are assembled first, then placed into responsive workflow tabs.
         self.input_layout = QVBoxLayout()
         self.config_layout = QVBoxLayout()
         # process_layout and export_layout will also go into the left panel
@@ -737,36 +1672,46 @@ class GeoTaggerApp(QWidget):
         self.input_group = QGroupBox("Input Data")
         input_group_layout = QVBoxLayout()
 
-        gps_layout = QHBoxLayout()
-        self.gps_label = QLabel("GPS File (GPX/CSV):")
-        gps_layout.addWidget(self.gps_label)
+        gps_layout = QGridLayout()
+        gps_layout.setHorizontalSpacing(8)
+        gps_layout.setVerticalSpacing(6)
+        self.gps_label = QLabel("GPS Track(s) (GPX/CSV/TLOG):")
+        gps_layout.addWidget(self.gps_label, 0, 0)
         self.gps_path_display = QLineEdit()
-        self.gps_path_display.setPlaceholderText("Load GPS track...")
+        self.gps_path_display.setPlaceholderText("Load a GPS track or one or more TLOG files...")
         self.gps_path_display.setReadOnly(True)
-        gps_layout.addWidget(self.gps_path_display, 1)
-        self.gps_load_button = QPushButton("Load GPS...")
+        gps_layout.addWidget(self.gps_path_display, 1, 0, 1, 2)
+        self.gps_load_button = QPushButton("Load GPS Log(s)...")
         self.gps_load_button.setIcon(QIcon.fromTheme("document-open"))
+        self.gps_load_button.setToolTip(
+            "Select one GPX/CSV track, or select multiple BlueBoat MAVLink TLOG files."
+        )
         self.gps_load_button.clicked.connect(self.load_gps_data)
-        gps_layout.addWidget(self.gps_load_button)
+        gps_layout.addWidget(
+            self.gps_load_button,
+            0,
+            1,
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
+        gps_layout.setColumnStretch(0, 1)
         input_group_layout.addLayout(gps_layout)
 
-        # Find this section
-        media_layout = QHBoxLayout()
-        # CHANGE THE LABEL TEXT
+        media_layout = QGridLayout()
+        media_layout.setHorizontalSpacing(8)
+        media_layout.setVerticalSpacing(6)
         self.media_label = QLabel("Image Parent Directory (Recursive):") 
-        # ADD A TOOLTIP TO THE LABEL
         self.media_label.setToolTip("Select the main folder containing your images.\nThe application will search through all subfolders.")
-        media_layout.addWidget(self.media_label)
+        media_layout.addWidget(self.media_label, 0, 0, 1, 2)
         self.media_path_display = QLineEdit()
         self.media_path_display.setPlaceholderText("Load parent image directory...") # Optional text change
         self.media_path_display.setReadOnly(True)
-        media_layout.addWidget(self.media_path_display, 1)
+        media_layout.addWidget(self.media_path_display, 1, 0, 1, 2)
         self.media_load_button = QPushButton("Load Images...")
         self.media_load_button.setIcon(QIcon.fromTheme("folder-image"))
         # ADD/UPDATE THE BUTTON'S TOOLTIP
         self.media_load_button.setToolTip("Select the main folder; all images in it and its subfolders will be loaded.")
         self.media_load_button.clicked.connect(self.load_media)
-        media_layout.addWidget(self.media_load_button)
+        media_layout.addWidget(self.media_load_button, 2, 0)
 
         self.media_exif_button = QPushButton("Load GPS-Tagged Images...")
         self.media_exif_button.setIcon(QIcon.fromTheme("folder-image"))
@@ -775,31 +1720,44 @@ class GeoTaggerApp(QWidget):
             "Skips the GPS-file load and time-sync steps — you can go straight to defining transects."
         )
         self.media_exif_button.clicked.connect(self.load_images_with_embedded_gps)
-        media_layout.addWidget(self.media_exif_button)
+        media_layout.addWidget(self.media_exif_button, 2, 1)
+        media_layout.setColumnStretch(0, 1)
+        media_layout.setColumnStretch(1, 1)
 
         input_group_layout.addLayout(media_layout)
 
         tz_layout = QHBoxLayout()
         self.media_timezone_label = QLabel("Data Timezone:")
         tz_layout.addWidget(self.media_timezone_label)
-        self.media_timezone_input = QComboBox()
-        self.media_timezone_input.setToolTip("Timezone for: Image EXIF/GPS CSV (if naive), Transect CSV (if naive), Transect Display, Date Filter.")
+        self.media_timezone_input = NoWheelComboBox()
+        self.media_timezone_input.setToolTip(
+            "Timezone for Image EXIF/GPS CSV (if naive), transect display, "
+            "and date filtering. Use the dropdown or keyboard; scrolling the "
+            "form will not change it."
+        )
         tz_layout.addWidget(self.media_timezone_input, 1)
         all_tz_list = ["UTC"]
         try:
             all_tz_list = sorted(pytz.common_timezones)
             self.media_timezone_input.addItems(all_tz_list)
             try:
-                local_name = datetime.now().astimezone().tzname()
-                idx = self.media_timezone_input.findText(local_name, Qt.MatchFlag.MatchContains|Qt.MatchFlag.MatchFixedString)
+                idx = self.media_timezone_input.findText(
+                    DEFAULT_DATA_TIMEZONE,
+                    Qt.MatchFlag.MatchFixedString,
+                )
                 self.media_timezone_input.setCurrentIndex(idx if idx >=0 else self.media_timezone_input.findText("UTC", Qt.MatchFlag.MatchFixedString))
             except Exception:
-                self.media_timezone_input.setCurrentIndex(self.media_timezone_input.findText("UTC", Qt.MatchFlag.MatchFixedString))
+                self.media_timezone_input.setCurrentIndex(
+                    self.media_timezone_input.findText(
+                        DEFAULT_DATA_TIMEZONE,
+                        Qt.MatchFlag.MatchFixedString,
+                    )
+                )
             self.current_timezone_str = self.media_timezone_input.currentText()
             self.media_timezone_input.currentTextChanged.connect(self.update_current_timezone)
-        except Exception as tz_err:
-            self.media_timezone_input.addItems(["UTC"])
-            self.current_timezone_str = "UTC"
+        except Exception:
+            self.media_timezone_input.addItems([DEFAULT_DATA_TIMEZONE, "UTC"])
+            self.current_timezone_str = DEFAULT_DATA_TIMEZONE
         self.media_timezone_input.setEditable(True)
         self.media_timezone_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         completer = QCompleter(all_tz_list, self)
@@ -811,7 +1769,7 @@ class GeoTaggerApp(QWidget):
         date_filter_layout = QHBoxLayout()
         self.date_filter_label = QLabel(f"Filter GPS by Date ({self.current_timezone_str}):")
         date_filter_layout.addWidget(self.date_filter_label)
-        self.date_filter_combo = QComboBox()
+        self.date_filter_combo = NoWheelComboBox()
         self.date_filter_combo.setToolTip("Filter displayed GPS track & transect ops to a single local date (using Data Timezone).")
         self.date_filter_combo.addItem("Show All Dates")
         self.date_filter_combo.setEnabled(False)
@@ -961,7 +1919,7 @@ class GeoTaggerApp(QWidget):
 
         # 1) Select‐sync button
         self.select_sync_image_button = QPushButton("1. Select Sync Image…")
-        self.select_sync_image_button.setFixedSize(120, 30)
+        self.select_sync_image_button.setMinimumHeight(34)
         self.select_sync_image_button.clicked.connect(self.select_image_for_sync)
         visual_sync_layout.addWidget(self.select_sync_image_button, 0, 0, 1, 1)
 
@@ -1006,7 +1964,109 @@ class GeoTaggerApp(QWidget):
         self.visual_sync_group.setLayout(visual_sync_layout)
         time_sync_layout.addWidget(self.visual_sync_group)
 
-        time_sync_layout.addLayout(visual_sync_layout)
+        self.folder_offset_group = QGroupBox("Per-Folder Camera Clock Offsets")
+        folder_offset_layout = QVBoxLayout()
+        folder_offset_controls = QGridLayout()
+        self.use_folder_offsets_checkbox = QCheckBox("Enable checked folder offsets")
+        self.use_folder_offsets_checkbox.setToolTip(
+            "Each top-level camera folder can use its own clock correction."
+        )
+        folder_offset_controls.addWidget(
+            self.use_folder_offsets_checkbox,
+            0,
+            0,
+            1,
+            2,
+        )
+        self.preserve_camera_clock_checkbox = QCheckBox(
+            "Analyze nearby folders as one continuous camera clock"
+        )
+        self.preserve_camera_clock_checkbox.setChecked(True)
+        self.preserve_camera_clock_checkbox.setToolTip(
+            "When consecutive camera folders are less than 30 minutes apart, "
+            "score one shared offset using all of their images. Long folders "
+            "can then resolve timing that is ambiguous for short folders."
+        )
+        folder_offset_controls.addWidget(
+            self.preserve_camera_clock_checkbox,
+            1,
+            0,
+            1,
+            2,
+        )
+        self.analyze_folder_offsets_button = QPushButton("Analyze Folder Offsets")
+        self.analyze_folder_offsets_button.setToolTip(
+            "Find offsets that place the most camera timestamps inside real GPS sessions. "
+            "Suggestions still require visual confirmation when timing is ambiguous."
+        )
+        self.analyze_folder_offsets_button.clicked.connect(
+            self.analyze_folder_time_offsets
+        )
+        folder_offset_controls.addWidget(self.analyze_folder_offsets_button, 2, 0)
+        self.review_sequence_button = QPushButton("Review First Photos")
+        self.review_sequence_button.setToolTip(
+            "Show the beginning of the selected camera folder and choose a "
+            "recognisable frame for Visual Sync."
+        )
+        self.review_sequence_button.clicked.connect(
+            self.review_selected_folder_sequence
+        )
+        self.review_sequence_button.setEnabled(False)
+        folder_offset_controls.addWidget(self.review_sequence_button, 2, 1)
+        folder_offset_controls.setColumnStretch(0, 1)
+        folder_offset_controls.setColumnStretch(1, 1)
+        folder_offset_layout.addLayout(folder_offset_controls)
+
+        self.folder_offset_table = QTableWidget(0, 5)
+        self.folder_offset_table.setHorizontalHeaderLabels(
+            [
+                "Use",
+                "Folder",
+                "Offset (s)",
+                "GPS Coverage",
+                "Status",
+            ]
+        )
+        self.folder_offset_table.setAlternatingRowColors(True)
+        self.folder_offset_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.folder_offset_table.verticalHeader().setVisible(False)
+        folder_header = self.folder_offset_table.horizontalHeader()
+        folder_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        folder_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        folder_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        folder_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        folder_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.folder_offset_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.folder_offset_table.setMinimumHeight(126)
+        self.folder_offset_table.setMaximumHeight(210)
+        self.folder_offset_table.setToolTip(
+            "Tick Use only after accepting or visually confirming a row. Only "
+            "Offset (s) is editable. A wide equal-score range is ambiguous."
+        )
+        self.folder_offset_table.currentCellChanged.connect(
+            self._update_folder_offset_detail
+        )
+        folder_offset_layout.addWidget(self.folder_offset_table)
+
+        self.folder_offset_note = QLabel(
+            "Analyze the camera folders, then select a row to inspect its evidence. "
+            "Only checked rows are applied."
+        )
+        self.folder_offset_note.setObjectName("helperText")
+        self.folder_offset_note.setWordWrap(True)
+        folder_offset_layout.addWidget(self.folder_offset_note)
+        self.folder_offset_detail_label = QLabel(
+            "No folder analysis yet. Suggestions will appear here without being enabled."
+        )
+        self.folder_offset_detail_label.setObjectName("detailPanel")
+        self.folder_offset_detail_label.setWordWrap(True)
+        folder_offset_layout.addWidget(self.folder_offset_detail_label)
+        self.folder_offset_group.setLayout(folder_offset_layout)
+        time_sync_layout.addWidget(self.folder_offset_group)
 
         self.sync_manual_radio.toggled.connect(self.update_sync_method_ui)
         self.sync_visual_radio.toggled.connect(self.update_sync_method_ui)
@@ -1133,15 +2193,12 @@ class GeoTaggerApp(QWidget):
         self.config_group.setLayout(config_layout_main)
         self.config_layout.addWidget(self.config_group)
 
-        # Add input_layout and config_layout to top_layout (for left panel)
-        top_layout.addLayout(self.input_layout, 1)
-        top_layout.addLayout(self.config_layout, 1)
-
         # --- Process Layout (for left panel) ---
         process_layout = QVBoxLayout()
-        self.process_button = QPushButton(" Process Data")
+        self.process_button = QPushButton("Process Data")
+        self.process_button.setObjectName("primaryAction")
         self.process_button.setIcon(QIcon.fromTheme("system-run"))
-        self.process_button.setStyleSheet("QPushButton { background-color: #c8e6c9; height: 40px; font-size: 16px; font-weight: bold; border: 1px solid #a5d6a7; border-radius: 4px; padding: 5px;} QPushButton:hover { background-color: #a5d6a7; } QPushButton:pressed { background-color: #81c784; } QPushButton:disabled { background-color: #e0e0e0; color: #a0a0a0; border-color: #c0c0c0; }")
+        self.process_button.setMinimumHeight(44)
         self.process_button.clicked.connect(self.start_processing)
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -1156,15 +2213,15 @@ class GeoTaggerApp(QWidget):
         settings = self.map_view.settings()
         try:
             settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
             settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
             if hasattr(QWebEngineSettings.WebAttribute, 'DnsPrefetchEnabled'):
                 settings.setAttribute(QWebEngineSettings.WebAttribute.DnsPrefetchEnabled, True)
             if hasattr(QWebEngineSettings.WebAttribute, 'FullScreenSupportEnabled'):
-                settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
+                settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, False)
         except Exception as e:
             self.log_message(f"Error setting some WebEngine attributes: {e}", logging.WARNING)
 
@@ -1178,14 +2235,31 @@ class GeoTaggerApp(QWidget):
         self.output_tabs.addTab(self.map_view, "Map View")
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(6)
-        self.results_table.setHorizontalHeaderLabels(["Identifier", "File Path", "Original Time", "UTC Time", "Lat", "Lon"])
+        self.results_table.setColumnCount(8)
+        self.results_table.setHorizontalHeaderLabels(
+            [
+                "Identifier",
+                "File Path",
+                "Camera Group",
+                "Applied Offset (seconds)",
+                "Original Time",
+                "UTC Time",
+                "Lat",
+                "Lon",
+            ]
+        )
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSortingEnabled(True)
         self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setWordWrap(False)
+        results_header = self.results_table.horizontalHeader()
+        results_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        results_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column, width in enumerate((180, 360, 130, 155, 210, 210, 110, 110)):
+            self.results_table.setColumnWidth(column, width)
         self.output_tabs.addTab(self.results_table, "Results Table")
 
         self.log_output = QTextEdit()
@@ -1196,7 +2270,7 @@ class GeoTaggerApp(QWidget):
         logging.getLogger().addHandler(log_handler)
         logging.getLogger().setLevel(logging.INFO)
         self.output_tabs.addTab(self.log_output, "Log")
-        self.output_tabs.setCurrentIndex(2) # Default to Log tab
+        self.output_tabs.setCurrentIndex(0)
 
         # --- Export Layout (for left panel) ---
         export_layout = QHBoxLayout()
@@ -1223,27 +2297,142 @@ class GeoTaggerApp(QWidget):
         export_layout.addWidget(self.geotag_images_button)
         export_layout.addWidget(self.extract_button)
 
-        # --- Create Left Panel Widget ---
-        left_panel_widget = QWidget()
-        left_panel_layout = QVBoxLayout(left_panel_widget)
-        left_panel_layout.addLayout(top_layout) # Contains input_layout and config_layout
-        left_panel_layout.addLayout(process_layout)
-        left_panel_layout.addLayout(export_layout)
-        left_panel_layout.addStretch(1) # Add stretch to push controls up
+        # --- Responsive workflow sidebar ---
+        for widget in (
+            self.input_group,
+            self.csv_mapping_group,
+            self.transect_csv_load_group,
+            self.transect_csv_mapping_group,
+        ):
+            self.input_layout.removeWidget(widget)
+        for widget in (
+            self.time_sync_group,
+            self.transect_group,
+            self.batch_ops_group,
+        ):
+            config_layout_main.removeWidget(widget)
+        self.config_layout.removeWidget(self.config_group)
+        self.config_group.hide()
+        process_layout.removeWidget(self.process_button)
+        process_layout.removeWidget(self.progress_bar)
+        for button in (
+            self.export_csv_button,
+            self.save_map_button,
+            self.geotag_images_button,
+            self.extract_button,
+        ):
+            export_layout.removeWidget(button)
 
-        # --- Create Splitter ---
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left_panel_widget)
-        splitter.addWidget(self.output_tabs)
+        def create_scrolled_tab(content_widget):
+            scroll_area = QScrollArea()
+            scroll_area.setObjectName("sidebarScroll")
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+            scroll_area.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            scroll_area.setWidget(content_widget)
+            return scroll_area
 
-        # Set initial sizes and stretch factors for the splitter
-        # Give more relative size and stretch to the map/output panel
-        splitter.setSizes([450, 850]) # Adjust these values as needed for a good default
-        splitter.setStretchFactor(0, 0) # Left panel less stretchy
-        splitter.setStretchFactor(1, 1) # Right panel (map/output) more stretchy
+        setup_content = QWidget()
+        setup_content.setObjectName("sidebarContent")
+        setup_content_layout = QVBoxLayout(setup_content)
+        setup_content_layout.setContentsMargins(8, 10, 8, 12)
+        setup_content_layout.setSpacing(10)
+        setup_intro = QLabel(
+            "Load the survey inputs, align the camera clocks, then process."
+        )
+        setup_intro.setObjectName("sectionIntro")
+        setup_intro.setWordWrap(True)
+        setup_content_layout.addWidget(setup_intro)
+        setup_content_layout.addWidget(self.input_group)
+        setup_content_layout.addWidget(self.csv_mapping_group)
+        setup_content_layout.addWidget(self.time_sync_group)
+        setup_content_layout.addStretch()
 
-        # Add splitter to the main layout
-        self.main_layout.addWidget(splitter)
+        transect_content = QWidget()
+        transect_content.setObjectName("sidebarContent")
+        transect_content_layout = QVBoxLayout(transect_content)
+        transect_content_layout.setContentsMargins(8, 10, 8, 12)
+        transect_content_layout.setSpacing(10)
+        transect_intro = QLabel(
+            "Define one transect on the map or load a set for batch extraction."
+        )
+        transect_intro.setObjectName("sectionIntro")
+        transect_intro.setWordWrap(True)
+        transect_content_layout.addWidget(transect_intro)
+        transect_content_layout.addWidget(self.transect_group)
+        transect_content_layout.addWidget(self.transect_csv_load_group)
+        transect_content_layout.addWidget(self.transect_csv_mapping_group)
+        transect_content_layout.addWidget(self.batch_ops_group)
+        transect_content_layout.addStretch()
+
+        self.workflow_tabs = QTabWidget()
+        self.workflow_tabs.setObjectName("workflowTabs")
+        self.workflow_tabs.setDocumentMode(True)
+        self.setup_scroll = create_scrolled_tab(setup_content)
+        self.transect_scroll = create_scrolled_tab(transect_content)
+        self.workflow_tabs.addTab(self.setup_scroll, "1  Setup & Sync")
+        self.workflow_tabs.addTab(self.transect_scroll, "2  Transects")
+
+        sidebar_heading = QLabel("Survey workflow")
+        sidebar_heading.setObjectName("sidebarHeading")
+        sidebar_helper = QLabel(
+            "Controls stay here while the map remains visible."
+        )
+        sidebar_helper.setObjectName("helperText")
+
+        action_footer = QFrame()
+        action_footer.setObjectName("actionFooter")
+        action_footer_layout = QVBoxLayout(action_footer)
+        action_footer_layout.setContentsMargins(12, 12, 12, 12)
+        action_footer_layout.setSpacing(8)
+        action_footer_layout.addWidget(self.process_button)
+        action_footer_layout.addWidget(self.progress_bar)
+
+        export_grid = QGridLayout()
+        export_grid.setHorizontalSpacing(8)
+        export_grid.setVerticalSpacing(8)
+        export_grid.addWidget(self.export_csv_button, 0, 0)
+        export_grid.addWidget(self.save_map_button, 0, 1)
+        export_grid.addWidget(self.geotag_images_button, 1, 0)
+        export_grid.addWidget(self.extract_button, 1, 1)
+        export_grid.setColumnStretch(0, 1)
+        export_grid.setColumnStretch(1, 1)
+        action_footer_layout.addLayout(export_grid)
+
+        self.left_panel_widget = QWidget()
+        self.left_panel_widget.setObjectName("sidebar")
+        self.left_panel_widget.setMinimumWidth(400)
+        self.left_panel_widget.setMaximumWidth(620)
+        left_panel_layout = QVBoxLayout(self.left_panel_widget)
+        left_panel_layout.setContentsMargins(12, 12, 12, 12)
+        left_panel_layout.setSpacing(8)
+        left_panel_layout.addWidget(sidebar_heading)
+        left_panel_layout.addWidget(sidebar_helper)
+        left_panel_layout.addWidget(self.workflow_tabs, 1)
+        left_panel_layout.addWidget(action_footer)
+
+        self.output_tabs.setObjectName("outputTabs")
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(7)
+        self.main_splitter.addWidget(self.left_panel_widget)
+        self.main_splitter.addWidget(self.output_tabs)
+        self.main_splitter.setSizes([480, 1020])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_layout.addWidget(self.main_splitter, 1)
+
+        self._apply_modern_styles()
+        self.ui_settings = QSettings("Tommoir1", "GeoTagger")
+        saved_geometry = self.ui_settings.value("window_geometry")
+        if saved_geometry:
+            self.restoreGeometry(saved_geometry)
+        saved_splitter = self.ui_settings.value("main_splitter")
+        if saved_splitter:
+            self.main_splitter.restoreState(saved_splitter)
 
         self.log_message("GeoTagger Application started.", logging.INFO)
         if not GEOPY_AVAILABLE:
@@ -1252,6 +2441,253 @@ class GeoTaggerApp(QWidget):
         self._update_batch_processing_ui_states()
         self.enforce_length_checkbox.stateChanged.connect(self.update_preset_length_circle_on_map)
         self.preset_length_spinbox.valueChanged.connect(self.update_preset_length_circle_on_map)
+
+    def _apply_modern_styles(self):
+        self.setStyleSheet(
+            """
+            QWidget#appRoot {
+                background: #f4f7fb;
+                color: #172033;
+                font-family: "Segoe UI";
+                font-size: 10pt;
+            }
+            QDialog {
+                background: #f4f7fb;
+                color: #172033;
+            }
+            QFrame#appHeader {
+                background: #ffffff;
+                border-bottom: 1px solid #dbe3ee;
+            }
+            QLabel#appTitle {
+                color: #0f172a;
+                font-size: 18pt;
+                font-weight: 700;
+            }
+            QLabel#dialogHeading {
+                color: #0f172a;
+                font-size: 16pt;
+                font-weight: 700;
+            }
+            QLabel#appSubtitle, QLabel#helperText {
+                color: #64748b;
+                font-size: 9pt;
+            }
+            QLabel#statusPill {
+                background: #e8f0ff;
+                color: #1d4ed8;
+                border: 1px solid #c7d7fe;
+                border-radius: 14px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QWidget#sidebar {
+                background: #eef3f8;
+                border-right: 1px solid #dbe3ee;
+            }
+            QLabel#sidebarHeading {
+                color: #0f172a;
+                font-size: 15pt;
+                font-weight: 700;
+            }
+            QLabel#sectionIntro {
+                background: #eaf2ff;
+                color: #334155;
+                border: 1px solid #d3e2fb;
+                border-radius: 8px;
+                padding: 9px 11px;
+            }
+            QLabel#detailPanel {
+                background: #f8fafc;
+                color: #334155;
+                border: 1px solid #dbe3ee;
+                border-radius: 8px;
+                padding: 9px 10px;
+            }
+            QFrame#previewPanel {
+                min-width: 330px;
+                max-width: 360px;
+                background: #ffffff;
+                border: 1px solid #dbe3ee;
+                border-radius: 10px;
+            }
+            QLabel#previewTitle {
+                color: #334155;
+                font-size: 11pt;
+                font-weight: 700;
+            }
+            QLabel#largePreview {
+                background: #0f172a;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QScrollArea#sidebarScroll, QWidget#sidebarContent {
+                background: transparent;
+                border: none;
+            }
+            QGroupBox {
+                background: #ffffff;
+                border: 1px solid #dbe3ee;
+                border-radius: 9px;
+                margin-top: 13px;
+                padding: 10px 8px 8px 8px;
+                font-weight: 600;
+                color: #1e293b;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 0 5px;
+                color: #334155;
+                background: #ffffff;
+            }
+            QLineEdit, QComboBox, QDateTimeEdit, QDoubleSpinBox, QListWidget,
+            QTextEdit, QTableWidget {
+                background: #ffffff;
+                color: #172033;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 5px 7px;
+                selection-background-color: #cfe0ff;
+                selection-color: #172033;
+            }
+            QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus,
+            QDoubleSpinBox:focus, QListWidget:focus, QTableWidget:focus {
+                border: 1px solid #3b82f6;
+            }
+            QLineEdit:read-only {
+                background: #f8fafc;
+                color: #475569;
+            }
+            QPushButton {
+                min-height: 29px;
+                background: #ffffff;
+                color: #1e293b;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #f1f5f9;
+                border-color: #94a3b8;
+            }
+            QPushButton:pressed {
+                background: #e2e8f0;
+            }
+            QPushButton:checked {
+                background: #dbeafe;
+                color: #1d4ed8;
+                border-color: #60a5fa;
+            }
+            QPushButton:disabled {
+                background: #f1f5f9;
+                color: #94a3b8;
+                border-color: #e2e8f0;
+            }
+            QPushButton#primaryAction {
+                background: #2563eb;
+                color: #ffffff;
+                border: 1px solid #1d4ed8;
+                border-radius: 8px;
+                min-height: 42px;
+                font-size: 11pt;
+                font-weight: 700;
+            }
+            QPushButton#primaryAction:hover {
+                background: #1d4ed8;
+            }
+            QPushButton#primaryAction:disabled {
+                background: #cbd5e1;
+                color: #f8fafc;
+                border-color: #cbd5e1;
+            }
+            QToolButton {
+                background: #ffffff;
+                color: #334155;
+                border: 2px solid #dbe3ee;
+                border-radius: 9px;
+                padding: 5px;
+                font-weight: 600;
+            }
+            QToolButton:hover {
+                background: #f8fafc;
+                border-color: #93c5fd;
+            }
+            QToolButton:checked {
+                background: #eff6ff;
+                color: #1d4ed8;
+                border-color: #2563eb;
+            }
+            QFrame#actionFooter {
+                background: #ffffff;
+                border: 1px solid #dbe3ee;
+                border-radius: 10px;
+            }
+            QProgressBar {
+                min-height: 9px;
+                max-height: 9px;
+                border: none;
+                border-radius: 4px;
+                background: #e2e8f0;
+                color: transparent;
+            }
+            QProgressBar::chunk {
+                background: #22c55e;
+                border-radius: 4px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #dbe3ee;
+                border-radius: 8px;
+                background: #ffffff;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #e7edf5;
+                color: #475569;
+                border: 1px solid #d5dee9;
+                border-bottom: none;
+                padding: 8px 14px;
+                margin-right: 3px;
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #1d4ed8;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #f1f5f9;
+            }
+            QHeaderView::section {
+                background: #edf2f7;
+                color: #475569;
+                border: none;
+                border-right: 1px solid #dbe3ee;
+                border-bottom: 1px solid #dbe3ee;
+                padding: 6px;
+                font-weight: 600;
+            }
+            QTableWidget {
+                gridline-color: #e2e8f0;
+                alternate-background-color: #f8fafc;
+            }
+            QSplitter::handle {
+                background: #dbe3ee;
+            }
+            QSplitter::handle:hover {
+                background: #93b4e8;
+            }
+            QRadioButton, QCheckBox {
+                spacing: 7px;
+                color: #334155;
+            }
+            """
+        )
 
     def _extract_exif_gps(self, image_path):
         """Return (lat, lon, gps_utc_datetime). Any/all may be None on failure.
@@ -1376,12 +2812,14 @@ class GeoTaggerApp(QWidget):
 
             # Set application state for the rest of the workflow
             self.gps_file_path = None
+            self.gps_file_paths = []
             self.gps_path_display.setText(f"<from EXIF: {len(gps_df)} points>")
             self.media_path = dir_path
             self.media_type = 'images'
             self.media_path_display.setText(os.path.basename(dir_path))
             self.original_media_list = media_items
             self.preliminary_media_list = media_items
+            self._preliminary_media_path = os.path.normcase(os.path.abspath(dir_path))
             self.preliminary_gps_df = gps_df.copy()
             self.csv_mapping_group.setVisible(False)
             self.saved_transects = []
@@ -1463,7 +2901,16 @@ class GeoTaggerApp(QWidget):
                 source_path = self.identifier_to_path_map.get(row.get('Identifier'))
                 if source_path and os.path.exists(source_path):
                     try:
-                        shutil.copy2(source_path, specific_transect_output_dir)
+                        copy_result = copy_file_safely(
+                            source_path,
+                            specific_transect_output_dir,
+                            source_root=self.media_path,
+                        )
+                        if copy_result.renamed_for_collision:
+                            self.log_message(
+                                f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                logging.INFO,
+                            )
                         copy_ok_count += 1
                     except Exception as copy_e:
                         self.log_message(f"Error copying image for transect '{transect_name}': {copy_e}", logging.ERROR)
@@ -1485,8 +2932,7 @@ class GeoTaggerApp(QWidget):
             self._update_batch_processing_ui_states()
 
             if self.map_view and self.map_view.page():
-                # **THIS IS THE CRITICAL FIX for the JS call**
-                # Use json.dumps to safely escape the name for JavaScript
+                # Use json.dumps to safely escape the name for JavaScript.
                 safe_name_json = json.dumps(transect_name)
                 js_call = f"drawSavedTransectLine({start_point['latitude']}, {start_point['longitude']}, {end_point['latitude']}, {end_point['longitude']}, {safe_name_json});"
                 self.map_view.page().runJavaScript(js_call)
@@ -1501,26 +2947,38 @@ class GeoTaggerApp(QWidget):
     def enter_transect_mode(self):
         self.log_message("Switching to Transect-only mode.", logging.INFO)
         # hide data-loading panels
-        if hasattr(self, 'input_group'): self.input_group.hide()
-        if hasattr(self, 'csv_mapping_group'): self.csv_mapping_group.hide()
-        if hasattr(self, 'transect_csv_load_group'): self.transect_csv_load_group.hide()
-        if hasattr(self, 'transect_csv_mapping_group'): self.transect_csv_mapping_group.hide()
+        if hasattr(self, 'input_group'):
+            self.input_group.hide()
+        if hasattr(self, 'csv_mapping_group'):
+            self.csv_mapping_group.hide()
+        if hasattr(self, 'transect_csv_load_group'):
+            self.transect_csv_load_group.hide()
+        if hasattr(self, 'transect_csv_mapping_group'):
+            self.transect_csv_mapping_group.hide()
 
         # These individual controls are inside input_group but good to hide explicitly if input_group might not always exist
-        if hasattr(self, 'media_load_button'): self.media_load_button.hide()
-        if hasattr(self, 'gps_load_button'): self.gps_load_button.hide()
-        if hasattr(self, 'media_timezone_input'): self.media_timezone_input.hide()
-        if hasattr(self, 'media_timezone_label'): self.media_timezone_label.hide()
-        if hasattr(self, 'date_filter_label'): self.date_filter_label.hide()
-        if hasattr(self, 'date_filter_combo'): self.date_filter_combo.hide()
+        if hasattr(self, 'media_load_button'):
+            self.media_load_button.hide()
+        if hasattr(self, 'gps_load_button'):
+            self.gps_load_button.hide()
+        if hasattr(self, 'media_timezone_input'):
+            self.media_timezone_input.hide()
+        if hasattr(self, 'media_timezone_label'):
+            self.media_timezone_label.hide()
+        if hasattr(self, 'date_filter_label'):
+            self.date_filter_label.hide()
+        if hasattr(self, 'date_filter_combo'):
+            self.date_filter_combo.hide()
 
         # hide sync
         widgets_to_hide = []
-        if hasattr(self, 'sync_point_radio'): widgets_to_hide.append(self.sync_point_radio)
-        if hasattr(self, 'sync_manual_radio'): widgets_to_hide.append(self.sync_manual_radio)
-        if hasattr(self, 'time_sync_group'): widgets_to_hide.append(self.time_sync_group)
-        # MODIFICATION: DO NOT hide self.batch_ops_group
-        # if hasattr(self, 'batch_ops_group'): widgets_to_hide.append(self.batch_ops_group)
+        if hasattr(self, 'sync_point_radio'):
+            widgets_to_hide.append(self.sync_point_radio)
+        if hasattr(self, 'sync_manual_radio'):
+            widgets_to_hide.append(self.sync_manual_radio)
+        if hasattr(self, 'time_sync_group'):
+            widgets_to_hide.append(self.time_sync_group)
+        # Keep batch operations visible in transect-only mode.
 
         for w in widgets_to_hide:
             w.hide()
@@ -1530,14 +2988,20 @@ class GeoTaggerApp(QWidget):
             self.batch_ops_group.show()
 
         # hide the process button and progress bar
-        if hasattr(self, 'process_button'): self.process_button.hide()
-        if hasattr(self, 'progress_bar'): self.progress_bar.hide()
+        if hasattr(self, 'process_button'):
+            self.process_button.hide()
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.hide()
 
         # hide the export buttons
-        if hasattr(self, 'export_csv_button'): self.export_csv_button.hide()
-        if hasattr(self, 'save_map_button'): self.save_map_button.hide()
-        if hasattr(self, 'geotag_images_button'): self.geotag_images_button.hide()
-        if hasattr(self, 'extract_button'): self.extract_button.hide()
+        if hasattr(self, 'export_csv_button'):
+            self.export_csv_button.hide()
+        if hasattr(self, 'save_map_button'):
+            self.save_map_button.hide()
+        if hasattr(self, 'geotag_images_button'):
+            self.geotag_images_button.hide()
+        if hasattr(self, 'extract_button'):
+            self.extract_button.hide()
 
         if hasattr(self, 'output_tabs'):
             for i in range(self.output_tabs.count()):
@@ -1551,10 +3015,10 @@ class GeoTaggerApp(QWidget):
                     self.output_tabs.setTabEnabled(i, True)
                     self.output_tabs.setCurrentIndex(i)
 
-        if hasattr(self, 'config_group'): self.config_group.show()
-        if hasattr(self, 'transect_group'): self.transect_group.show()
-
-        self.adjustSize()
+        if hasattr(self, 'transect_group'):
+            self.transect_group.show()
+        if hasattr(self, 'workflow_tabs'):
+            self.workflow_tabs.setCurrentIndex(1)
 
     @pyqtSlot(object, list, object)
     def processing_finished(self, results_df, original_media_list, processed_gps_df):
@@ -1562,7 +3026,6 @@ class GeoTaggerApp(QWidget):
         self.results_df = results_df
         self.original_media_list = original_media_list
         self.processed_gps_df = processed_gps_df
-        # --- ADD THIS BLOCK TO BUILD THE SPATIAL INDEX ---
         self.gps_kdtree = None # Reset any previous index
         if SCIPY_AVAILABLE and self.processed_gps_df is not None and not self.processed_gps_df.empty:
             self.log_message("Building spatial index (k-d tree) for GPS track for fast lookups...", logging.INFO)
@@ -1579,9 +3042,12 @@ class GeoTaggerApp(QWidget):
             except Exception as e:
                 self.log_message(f"Failed to build spatial index: {e}", logging.ERROR)
                 self.gps_kdtree = None
-        # --- END OF ADDED BLOCK ---
-
         self.preliminary_media_list = original_media_list
+        self._preliminary_media_path = (
+            os.path.normcase(os.path.abspath(self.media_path))
+            if self.media_path
+            else None
+        )
 
         self.identifier_to_path_map = {}
         if self.original_media_list:
@@ -1605,12 +3071,10 @@ class GeoTaggerApp(QWidget):
                 logging.WARNING
             )
 
-        base_gps_valid_for_date_filter = False
         if timed_processed_gps_df is not None and \
            isinstance(timed_processed_gps_df, pd.DataFrame) and \
            not timed_processed_gps_df.empty and \
            _gps_index_is_utc_or_time_missing(timed_processed_gps_df.index):
-            base_gps_valid_for_date_filter = True
             self.log_message(f"Stored processed GPS data ({len(self.processed_gps_df)} points). Populating date filter.", logging.INFO)
             try:
                 target_tz = pytz.timezone(self.current_timezone_str)
@@ -1639,7 +3103,8 @@ class GeoTaggerApp(QWidget):
                 self.log_message(f"Cannot populate date filter: Unknown timezone '{self.current_timezone_str}'.", logging.ERROR)
                 self.date_filter_combo.setEnabled(False)
                 self.date_filter_combo.setCurrentIndex(0)
-                if hasattr(self, 'load_transects_csv_button'): self.load_transects_csv_button.setEnabled(False)
+                if hasattr(self, 'load_transects_csv_button'):
+                    self.load_transects_csv_button.setEnabled(False)
                 self.show_error(f"Date filter cannot be populated due to invalid timezone: {self.current_timezone_str}. Please select a valid one.")
                 self.regenerate_map_display()
             except Exception as e:
@@ -1647,13 +3112,15 @@ class GeoTaggerApp(QWidget):
                 self.log_message(traceback.format_exc(), logging.DEBUG)
                 self.date_filter_combo.setEnabled(False)
                 self.date_filter_combo.setCurrentIndex(0)
-                if hasattr(self, 'load_transects_csv_button'): self.load_transects_csv_button.setEnabled(False)
+                if hasattr(self, 'load_transects_csv_button'):
+                    self.load_transects_csv_button.setEnabled(False)
                 self.regenerate_map_display()
         else:
             self.log_message("Processed GPS data not suitable for date filtering.", logging.WARNING)
             self.date_filter_combo.setEnabled(False)
             self.date_filter_combo.setCurrentIndex(0)
-            if hasattr(self, 'load_transects_csv_button'): self.load_transects_csv_button.setEnabled(False)
+            if hasattr(self, 'load_transects_csv_button'):
+                self.load_transects_csv_button.setEnabled(False)
             self.selected_filter_date = None
             self.filtered_gps_by_date_df = None
             self.regenerate_map_display()
@@ -1727,6 +3194,7 @@ class GeoTaggerApp(QWidget):
                     self.sync_gps_point_time_display.setText(actual_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + " Z")
                     self.sync_gps_point_coords_display.setText(f"Lat: {point_data['latitude']:.6f}, Lon: {point_data['longitude']:.6f}")
                     self.visual_sync_status_label.setText("Status: Sync point selected. Ready to process.")
+                    self._apply_visual_sync_calibration()
                 else:
                     self.show_error("Could not find the clicked GPS point in the data. Please try clicking closer to a point.")
             except Exception as e:
@@ -1777,15 +3245,10 @@ class GeoTaggerApp(QWidget):
             self.log_message(f"Transect START set: {self.transect_start_time}")
             self.highlight_map_range(self.transect_start_time, self.transect_start_time)
 
-        # ======================================================================
-        # ========= START OF THE MODIFIED CODE BLOCK FROM PREVIOUS REPLY =========
-        # ======================================================================
         elif self.transect_definition_mode == 'selecting_end':
             final_end_timestamp = actual_timestamp_from_click
 
             if self.enforce_length_checkbox.isChecked() and GEOPY_AVAILABLE:
-                # --- This is where your preset length logic goes ---
-                # (I've collapsed it for clarity, but it should be here)
                 preset_len_m = self.preset_length_spinbox.value()
                 self.log_message(f"Enforcing preset length: {preset_len_m}m", logging.DEBUG)
                 try:
@@ -1866,7 +3329,6 @@ class GeoTaggerApp(QWidget):
                     self.clear_transect_definition()
                     return
 
-                # --- START OF MODIFICATION ---
 
                 # 1. Count the images within the transect times
                 image_count = 0
@@ -1916,19 +3378,11 @@ class GeoTaggerApp(QWidget):
                     self.log_message("User cancelled transect naming. Transect not saved.", logging.INFO)
                     self.clear_transect_definition()
 
-                # --- END OF MODIFICATION ---
 
             # Schedule the nested function to run as soon as this event handler is finished.
             QTimer.singleShot(0, process_and_save_transect)
 
-                # --- END OF MODIFICATION ---
 
-        # ======================================================================
-        # ========= END OF THE MODIFIED CODE BLOCK FROM PREVIOUS REPLY ===========
-        # ======================================================================
-
-        # This line is executed *after* the if/elif block, for example,
-        # when the mode is 'selecting_start'.
         self.update_preset_length_circle_on_map()
 
     def _label_and_process_defined_transect(self):
@@ -1973,8 +3427,7 @@ class GeoTaggerApp(QWidget):
             if not safe_transect_name:
                 safe_transect_name = suggested_transect_name
 
-            # **THIS IS THE CRITICAL FIX for UI timing**
-            # Defer the rest of the processing to avoid a crash
+            # Defer processing until the input dialog has closed.
             QTimer.singleShot(0, lambda: self._finalize_transect_save(safe_transect_name))
         else:
             self.log_message("User cancelled or provided no name. Transect was not saved.")
@@ -2121,11 +3574,6 @@ class GeoTaggerApp(QWidget):
             self._update_batch_processing_ui_states()
             self.regenerate_map_display()
 
-    # Add this new method to the GeoTaggerApp class
-
-    # In the GeoTaggerApp class
-# Replace your entire _autosave_defined_transect method with this one.
-
     def _autosave_defined_transect(self, start_time, end_time, length_m, transect_name):
         """
         Automatically saves the transect definition and extracts the corresponding images.
@@ -2133,7 +3581,7 @@ class GeoTaggerApp(QWidget):
         self.log_message(f"Processing and saving transect '{transect_name}'...", logging.INFO)
         active_gps_df = self.get_active_gps_df()
 
-        # --- (Section 1: Determine autosave file path - This part is correct and remains) ---
+        # 1. Determine the autosave file path.
         if self.autosave_json_path is None:
             base_output_dir = None
             if self.media_path and os.path.isdir(self.media_path):
@@ -2158,15 +3606,13 @@ class GeoTaggerApp(QWidget):
             self.autosave_json_path = os.path.join(full_transect_dir_path, filename)
             self.log_message(f"New autosave session file created: {self.autosave_json_path}", logging.INFO)
 
-        # --- (Section 2: Get transect coordinates - This part is correct and remains) ---
+        # 2. Get transect coordinates.
         try:
             start_point = active_gps_df.loc[start_time]
             end_point = active_gps_df.loc[end_time]
         except KeyError:
             self.show_error("Autosave failed: Could not find transect start/end points in the GPS data.")
             return
-
-        # --- START OF NEW/RESTORED LOGIC ---
 
         # 3. Create a dedicated folder for this transect's images
         if self.media_path and os.path.isdir(self.media_path):
@@ -2199,14 +3645,21 @@ class GeoTaggerApp(QWidget):
                     source_path = self.identifier_to_path_map.get(row.get('Identifier'))
                     if source_path and os.path.exists(source_path):
                         try:
-                            shutil.copy2(source_path, specific_transect_output_dir)
+                            copy_result = copy_file_safely(
+                                source_path,
+                                specific_transect_output_dir,
+                                source_root=self.media_path,
+                            )
+                            if copy_result.renamed_for_collision:
+                                self.log_message(
+                                    f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                    logging.INFO,
+                                )
                             copy_ok_count += 1
                         except Exception as copy_e:
                             self.log_message(f"Error copying image for transect '{transect_name}': {copy_e}", logging.ERROR)
             
             self.log_message(f"Extracted and saved {copy_ok_count} images for transect '{transect_name}'.", logging.INFO)
-
-        # --- END OF NEW/RESTORED LOGIC ---
 
         # 5. Create the transect data dictionary for the JSON file
         new_transect_data = {
@@ -2220,7 +3673,7 @@ class GeoTaggerApp(QWidget):
             "saved_at_utc_iso": datetime.now(timezone.utc).isoformat(),
         }
 
-        # 6. Add to session list and save the JSON file (This part is correct and remains)
+        # 6. Add to the session list and save the JSON file.
         self.saved_transects.append(new_transect_data)
         self.log_message(f"Added '{transect_name}' to session list. Total transects: {len(self.saved_transects)}.")
 
@@ -2233,7 +3686,7 @@ class GeoTaggerApp(QWidget):
             self.show_error(f"Autosave failed while writing to file: {e}")
             return
 
-        # 7. Update UI (This part is correct and remains)
+        # 7. Update the UI.
         self._populate_loaded_transects_list()
         self._update_batch_processing_ui_states()
         if self.map_view and self.map_view.page():
@@ -2358,9 +3811,8 @@ class GeoTaggerApp(QWidget):
 
         total_transects_processed = 0
         total_images_copied = 0
+        total_images_already_present = 0
         failed_transects = []
-
-        active_gps_df = self.get_active_gps_df()
 
         for i, transect_info in enumerate(self.saved_transects):
             transect_name = transect_info.get("name", f"Unnamed_Transect_{i+1}")
@@ -2377,7 +3829,8 @@ class GeoTaggerApp(QWidget):
                     self.progress_bar.setValue(int(((i + 1) / len(self.saved_transects)) * 100))
                     continue
                 safe_transect_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in transect_name).strip()
-                if not safe_transect_name: safe_transect_name = f"Transect_{i+1}"
+                if not safe_transect_name:
+                    safe_transect_name = f"Transect_{i+1}"
                 specific_transect_output_dir = os.path.join(transects_output_parent_dir, safe_transect_name)
                 os.makedirs(specific_transect_output_dir, exist_ok=True)
 
@@ -2393,13 +3846,21 @@ class GeoTaggerApp(QWidget):
                         copy_fail_count_this_transect += 1
                         continue
                     try:
-                        new_filename = os.path.basename(source_path)
-                        destination_path = os.path.join(specific_transect_output_dir, new_filename)
-                        if os.path.exists(destination_path):
-                             self.log_message(f"Destination file '{destination_path}' (transect '{transect_name}') already exists. Overwriting.", logging.WARNING)
-                        shutil.copy2(source_path, destination_path)
+                        copy_result = copy_file_safely(
+                            source_path,
+                            specific_transect_output_dir,
+                            source_root=self.media_path,
+                        )
                         copy_ok_count_this_transect += 1
-                        total_images_copied += 1
+                        if copy_result.copied:
+                            total_images_copied += 1
+                        else:
+                            total_images_already_present += 1
+                        if copy_result.renamed_for_collision:
+                            self.log_message(
+                                f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                logging.INFO,
+                            )
                     except Exception as copy_e:
                         copy_fail_count_this_transect += 1
                         self.log_message(f"Error copying image ID '{identifier}' for transect '{transect_name}': {copy_e}", logging.ERROR)
@@ -2419,7 +3880,8 @@ class GeoTaggerApp(QWidget):
         self._update_batch_processing_ui_states()
 
         summary_msg = f"Batch processing finished.\n\nProcessed {total_transects_processed}/{len(self.saved_transects)} transects.\n" \
-                      f"Total images copied: {total_images_copied}.\n"
+                      f"Total images copied: {total_images_copied}.\n" \
+                      f"Identical images already present: {total_images_already_present}.\n"
         if failed_transects:
             summary_msg += f"\nFailed to process {len(failed_transects)} transect(s):\n- " + "\n- ".join(failed_transects)
             summary_msg += "\n\nCheck log for details."
@@ -2584,6 +4046,12 @@ class GeoTaggerApp(QWidget):
 
     def regenerate_map_display(self):
         self.log_message("Regenerating map display due to filter change or initial load...", logging.DEBUG)
+        if self._awaiting_worker_map:
+            self.log_message(
+                "Deferring duplicate map regeneration while the processing worker builds the initial map.",
+                logging.DEBUG,
+            )
+            return
         active_gps_for_map = self.get_active_gps_df()
         results_for_map = self.results_df if self.results_df is not None else pd.DataFrame()
 
@@ -2616,11 +4084,6 @@ class GeoTaggerApp(QWidget):
 
         self.update_transect_ui()
         self.update_preset_length_circle_on_map()
-
-    # REPLACE your entire old find_closest_point_in_df method with this:
-
-    # In GeoTaggerApp class
-# REPLACE your entire old find_closest_point_in_df method with this:
 
     def find_closest_point_in_df(self, target_coords, gps_df):
         """
@@ -2836,9 +4299,27 @@ class GeoTaggerApp(QWidget):
             return self.processed_gps_df
         return pd.DataFrame()
 
+    def _update_map_timezone_labels(self):
+        """Refresh displayed GPS times in-place without rebuilding the map."""
+        if (
+            not self._map_file_path
+            or not os.path.exists(self._map_file_path)
+            or not self.map_view
+            or not self.map_view.page()
+        ):
+            return
+        timezone_json = json.dumps(self.current_timezone_str)
+        javascript = (
+            "typeof updateMapTimezone === 'function' "
+            f"? updateMapTimezone({timezone_json}) : 0;"
+        )
+        self.map_view.page().runJavaScript(javascript)
+
     @pyqtSlot(str)
     def update_current_timezone(self, tz_string):
         if not tz_string:
+            return
+        if tz_string == self.current_timezone_str:
             return
         try:
             pytz.timezone(tz_string)
@@ -2846,6 +4327,10 @@ class GeoTaggerApp(QWidget):
             self.current_timezone_str = tz_string
             self.log_message(f"Data timezone changed from '{old_tz}' to: {self.current_timezone_str}", logging.INFO)
             self.date_filter_label.setText(f"Filter GPS by Date ({self.current_timezone_str}):")
+            if hasattr(self, 'header_timezone_label'):
+                self.header_timezone_label.setText(
+                    f"Camera time  {self.current_timezone_str}   •   GPS matching  UTC"
+                )
 
             if self.processed_gps_df is not None and not self.processed_gps_df.empty:
                 self.date_filter_combo.blockSignals(True)
@@ -2875,8 +4360,10 @@ class GeoTaggerApp(QWidget):
                     self.on_date_filter_changed(self.date_filter_combo.currentText())
                 else:
                     self.selected_filter_date = None
-                    self.filtered_gps_by_date_df = self.processed_gps_df.copy() if self.processed_gps_df is not None else None
-                    self.regenerate_map_display()
+                    self.filtered_gps_by_date_df = self.processed_gps_df
+                    self._update_map_timezone_labels()
+            else:
+                self._update_map_timezone_labels()
             self.update_transect_ui()
             self._populate_loaded_transects_list()
         except pytz.UnknownTimeZoneError:
@@ -2888,11 +4375,18 @@ class GeoTaggerApp(QWidget):
                 # self.current_timezone_str = old_tz # no need to change it back
                 self.media_timezone_input.blockSignals(False)
             else: # Fallback if old_tz somehow not in list
-                utc_idx = self.media_timezone_input.findText("UTC", Qt.MatchFlag.MatchFixedString)
-                if utc_idx >= 0:
-                    self.media_timezone_input.setCurrentIndex(utc_idx)
-                self.current_timezone_str = "UTC"
+                default_idx = self.media_timezone_input.findText(
+                    DEFAULT_DATA_TIMEZONE,
+                    Qt.MatchFlag.MatchFixedString,
+                )
+                if default_idx >= 0:
+                    self.media_timezone_input.setCurrentIndex(default_idx)
+                self.current_timezone_str = DEFAULT_DATA_TIMEZONE
             self.date_filter_label.setText(f"Filter GPS by Date ({self.current_timezone_str}):")
+            if hasattr(self, 'header_timezone_label'):
+                self.header_timezone_label.setText(
+                    f"Camera time  {self.current_timezone_str}   •   GPS matching  UTC"
+                )
         except Exception as e:
             self.log_message(f"Error updating timezone: {e}", logging.ERROR)
 
@@ -2909,11 +4403,13 @@ class GeoTaggerApp(QWidget):
             return local_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + f" ({self.current_timezone_str})"
         except pytz.UnknownTimeZoneError:
             self.log_message(f"Unknown timezone '{self.current_timezone_str}' for display. Using UTC.", logging.WARNING)
-            if dt_utc.tzinfo is None: dt_utc = pytz.utc.localize(dt_utc) # Ensure UTC if naive
+            if dt_utc.tzinfo is None:
+                dt_utc = pytz.utc.localize(dt_utc) # Ensure UTC if naive
             return dt_utc.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " (UTC)"
         except Exception as e:
             self.log_message(f"Error formatting time {dt_utc} to tz {self.current_timezone_str}: {e}", logging.ERROR)
-            if dt_utc.tzinfo is None: dt_utc = pytz.utc.localize(dt_utc) # Ensure UTC if naive
+            if dt_utc.tzinfo is None:
+                dt_utc = pytz.utc.localize(dt_utc) # Ensure UTC if naive
             return dt_utc.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " (UTC)"
 
     def update_transect_ui(self):
@@ -2983,8 +4479,15 @@ class GeoTaggerApp(QWidget):
         if not self.gps_file_path:
             return None
 
+        is_tlog = self.gps_file_path.lower().endswith('.tlog')
         is_csv = self.gps_file_path.lower().endswith(('.csv', '.txt'))
-        if is_csv:
+        if is_tlog:
+            gps_params['type'] = 'tlog'
+            gps_params['paths'] = self.gps_file_paths or [self.gps_file_path]
+            # TLOG record timestamps are UTC epoch values, while this timezone
+            # continues to describe the laptop/camera clock used for syncing.
+            gps_params['boat_timezone'] = self.current_timezone_str
+        elif is_csv:
             if not self.csv_mapping_group.isVisible():
                 self.show_error("CSV mapping details are not configured. Please reload the CSV file.")
                 return None
@@ -3013,7 +4516,7 @@ class GeoTaggerApp(QWidget):
             if not gps_params['datetime_format']:
                 self.show_error("Timestamp Format String is required for CSV parsing.")
                 return None
-        else: # GPX
+        else:  # GPX
             gps_params['type'] = 'gpx'
             gps_params['boat_timezone'] = 'UTC'
         return gps_params
@@ -3037,29 +4540,56 @@ class GeoTaggerApp(QWidget):
             temp_gps_df = None
             if parse_type == 'gpx':
                 temp_gps_df = engine.parse_gpx_file(self.gps_file_path)
+            elif parse_type == 'tlog':
+                tlog_paths = gps_parsing_params.get('paths') or [self.gps_file_path]
+                temp_gps_df = engine.parse_mavlink_tlog_files(tlog_paths)
+                self.log_message(
+                    f"Scanned {temp_gps_df.attrs.get('tlog_records_scanned', 0):,} "
+                    f"MAVLink records from {len(tlog_paths)} TLOG file(s).",
+                    logging.INFO,
+                )
+                self.log_message(
+                    f"Selected TLOG position streams: "
+                    f"{temp_gps_df.attrs.get('source_message_types', {})}.",
+                    logging.INFO,
+                )
+                skipped_files = temp_gps_df.attrs.get('skipped_files', [])
+                if skipped_files:
+                    self.log_message(
+                        "Skipped TLOG file(s) with no valid GPS positions: "
+                        + ", ".join(os.path.basename(path) for path in skipped_files),
+                        logging.WARNING,
+                    )
             elif parse_type == 'csv':
                 delimiter = ','
                 try:
                     with open(self.gps_file_path, 'r', errors='ignore') as f:
-                        dialect = csv.Sniffer().sniff(f.read(2048)); f.seek(0)
+                        dialect = csv.Sniffer().sniff(f.read(2048))
+                        f.seek(0)
                         delimiter = dialect.delimiter
-                except Exception: pass # Use default
+                except Exception:
+                    pass # Use default
 
                 temp_gps_df = engine.parse_boat_log_csv(
-    csv_file_path=self.gps_file_path,
-    date_col=gps_parsing_params['date_col'],
-    time_col=gps_parsing_params['time_col'],
-    lat_col=gps_parsing_params['lat_col'],
-    lon_col=gps_parsing_params['lon_col'],
-    alt_col=None,                                       
-    boat_timezone_str=gps_parsing_params['boat_timezone'],
-    datetime_format=gps_parsing_params['datetime_format'],
-    datetime_col=gps_parsing_params.get('datetime_col'),
-    delimiter=delimiter
-)
-
+                    csv_file_path=self.gps_file_path,
+                    date_col=gps_parsing_params['date_col'],
+                    time_col=gps_parsing_params['time_col'],
+                    lat_col=gps_parsing_params['lat_col'],
+                    lon_col=gps_parsing_params['lon_col'],
+                    alt_col=None,
+                    boat_timezone_str=gps_parsing_params['boat_timezone'],
+                    datetime_format=gps_parsing_params['datetime_format'],
+                    datetime_col=gps_parsing_params.get('datetime_col'),
+                    delimiter=delimiter,
+                )
 
             if temp_gps_df is not None and not temp_gps_df.empty:
+                invalid_coordinate_rows = int(temp_gps_df.attrs.get('invalid_coordinate_rows', 0))
+                if invalid_coordinate_rows:
+                    self.log_message(
+                        f"Ignored {invalid_coordinate_rows} GPS row(s) with missing or out-of-range coordinates.",
+                        logging.WARNING,
+                    )
                 # Basic validation and timezone conversion
                 if temp_gps_df.index.tz is None:
                     temp_gps_df.index = temp_gps_df.index.tz_localize('UTC')
@@ -3069,6 +4599,10 @@ class GeoTaggerApp(QWidget):
                     temp_gps_df.sort_index(inplace=True)
 
                 self.preliminary_gps_df = temp_gps_df.dropna(subset=['latitude', 'longitude'])
+                self._preliminary_gps_cache_key = _gps_parse_cache_key(
+                    self.gps_file_path,
+                    gps_parsing_params,
+                )
                 self.log_message(f"Preliminary GPS parse successful: {len(self.preliminary_gps_df)} points.", logging.INFO)
 
                 # Generate a preliminary map
@@ -3077,12 +4611,14 @@ class GeoTaggerApp(QWidget):
             else:
                 self.log_message("Preliminary GPS parse resulted in empty data.", logging.WARNING)
                 self.preliminary_gps_df = None
+                self._preliminary_gps_cache_key = None
                 self.map_view.setUrl(QUrl("about:blank"))
 
         except Exception as e:
             self.log_message(f"Preliminary GPS parse failed: {e}", logging.ERROR)
             self.show_error(f"Failed to pre-process GPS data for map display: {e}")
             self.preliminary_gps_df = None
+            self._preliminary_gps_cache_key = None
         finally:
             QApplication.restoreOverrideCursor()
             self.update_sync_method_ui()
@@ -3092,89 +4628,178 @@ class GeoTaggerApp(QWidget):
         if self.worker_thread and self.worker_thread.isRunning():
             self.show_error("Cannot load new data while processing is active.")
             return
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select GPS Data File", "", "GPS Logs (*.gpx *.csv *.txt);;All Files (*)")
-        if file_path:
-            # --- Reset application state for new file ---
-            self.gps_file_path = file_path
+        start_dir = os.path.dirname(self.gps_file_path) if self.gps_file_path else ""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select GPS Track or BlueBoat TLOG Files",
+            start_dir,
+            "GPS Tracks (*.gpx *.csv *.txt *.tlog);;"
+            "BlueBoat MAVLink Logs (*.tlog);;"
+            "GPX Tracks (*.gpx);;"
+            "CSV/TXT Tracks (*.csv *.txt);;"
+            "All Files (*)",
+        )
+        if not file_paths:
+            return
+
+        file_paths = [os.path.normpath(path) for path in file_paths]
+        selected_extensions = {os.path.splitext(path)[1].lower() for path in file_paths}
+        if len(file_paths) > 1 and selected_extensions != {'.tlog'}:
+            self.show_error(
+                "Multiple-file import is supported for TLOG files only. "
+                "Select one GPX/CSV file, or select only TLOG files."
+            )
+            return
+
+        file_path = file_paths[0]
+        is_tlog_selection = selected_extensions == {'.tlog'}
+        supported_extensions = {'.gpx', '.csv', '.txt', '.tlog'}
+        if not selected_extensions.issubset(supported_extensions):
+            unsupported = ", ".join(sorted(selected_extensions))
+            self.show_error(
+                f"Unsupported GPS file type: {unsupported}. Please use GPX, CSV/TXT, or TLOG."
+            )
+            return
+
+        def clear_selected_gps():
+            self.gps_file_path = None
+            self.gps_file_paths = []
+            self.gps_path_display.clear()
+            self.gps_path_display.setToolTip("")
+
+        # --- Reset application state for the new track selection ---
+        self.gps_file_path = file_path
+        self.gps_file_paths = file_paths if is_tlog_selection else [file_path]
+        if len(file_paths) == 1:
             self.gps_path_display.setText(os.path.basename(file_path))
+        else:
+            self.gps_path_display.setText(
+                f"{len(file_paths)} TLOG files — {os.path.basename(file_path)} …"
+            )
+        self.gps_path_display.setToolTip("\n".join(file_paths))
+        if is_tlog_selection:
+            self.log_message(
+                f"Selected {len(file_paths)} BlueBoat TLOG file(s): "
+                f"{', '.join(os.path.basename(path) for path in file_paths)}"
+            )
+        else:
             self.log_message(f"GPS file selected: {file_path}")
-            self.csv_mapping_group.setVisible(False)
-            self.results_df = self.processed_gps_df = self.preliminary_gps_df = None
-            self.original_media_list = self.saved_transects = []
-            self.identifier_to_path_map = {}
-            self.sync_image_info = self.sync_gps_point_info = None
+        self.csv_mapping_group.setVisible(False)
+        self.results_df = self.processed_gps_df = self.preliminary_gps_df = None
+        self._preliminary_gps_cache_key = None
+        self.original_media_list = self.saved_transects = []
+        self.identifier_to_path_map = {}
+        self.sync_image_info = self.sync_gps_point_info = None
+        self.clear_folder_offset_analysis()
 
-            self._populate_loaded_transects_list()
-            self.clear_transect_definition()
-            self.populate_results_table(None)
-            self.map_view.setUrl(QUrl("about:blank"))
-            self._map_file_path = None
+        self._populate_loaded_transects_list()
+        self.clear_transect_definition()
+        self.populate_results_table(None)
+        self.map_view.setUrl(QUrl("about:blank"))
+        self._remove_temporary_map_file(self._map_file_path)
+        self._map_file_path = None
 
-            # Reset buttons and UI states
-            for btn in [self.export_csv_button, self.save_map_button, self.geotag_images_button, self.extract_button]:
-                btn.setEnabled(False)
-            self.date_filter_combo.clear()
-            self.date_filter_combo.addItem("Show All Dates")
-            self.date_filter_combo.setEnabled(False)
+        for btn in [
+            self.export_csv_button,
+            self.save_map_button,
+            self.geotag_images_button,
+            self.extract_button,
+        ]:
+            btn.setEnabled(False)
+        self.date_filter_combo.clear()
+        self.date_filter_combo.addItem("Show All Dates")
+        self.date_filter_combo.setEnabled(False)
 
-            if file_path.lower().endswith(('.csv', '.txt')):
-                self.log_message("CSV/TXT file detected. Reading headers...")
+        if file_path.lower().endswith(('.csv', '.txt')):
+            self.log_message("CSV/TXT file detected. Reading headers...")
+            try:
+                delimiter = ','
                 try:
-                    delimiter=','
-                    try:
-                        with open(file_path, 'r', errors='ignore') as f:
-                            sample_lines = [line for line in (f.readline() for _ in range(20)) if line and line.strip()]
-                            sample = "".join(sample_lines)
-                            if not sample:
-                                self.show_error("CSV file appears to be empty or contains no valid data for sniffing.")
-                                self.gps_file_path = None
-                                self.gps_path_display.clear()
-                                return
-                            dialect = csv.Sniffer().sniff(sample)
-                            delimiter = dialect.delimiter
-                            self.log_message(f"Detected delimiter: '{repr(delimiter)}'")
-                    except csv.Error as sniff_err:
-                        self.log_message(f"Delimiter sniffing failed ({sniff_err}), using default ','.", logging.WARNING)
-                    except Exception as e:
-                        self.log_message(f"Error during delimiter sniffing setup ({e}), using default ','.", logging.WARNING)
-                    try:
-                        headers = pd.read_csv(file_path, sep=delimiter, nrows=0, engine='python', skipinitialspace=True, encoding_errors='ignore').columns.tolist()
-                    except UnicodeDecodeError:
-                        self.log_message("UnicodeDecodeError reading CSV headers with utf-8, trying latin-1", logging.WARNING)
-                        headers = pd.read_csv(file_path, sep=delimiter, nrows=0, engine='python', skipinitialspace=True, encoding='latin-1', encoding_errors='ignore').columns.tolist()
-                    except pd.errors.EmptyDataError:
-                        self.show_error("CSV file is empty or contains no data after headers.")
-                        self.gps_file_path = None
-                        self.gps_path_display.clear()
-                        return
-                    if not headers:
-                        self.show_error("Could not read headers from CSV file.")
-                        self.gps_file_path = None
-                        self.gps_path_display.clear()
-                        return
-                    self.log_message(f"CSV Headers found: {headers}")
-                    for combo in [self.lat_col_combo, self.lon_col_combo, self.date_col_combo, self.time_col_combo, self.datetime_col_combo]:
-                        combo.clear()
-                        combo.addItems(headers)
-                    for widget in [self.lat_col_combo, self.lon_col_combo, self.datetime_format_input]:
-                        widget.setEnabled(True)
-                    self.guess_common_columns(headers)
-                    self.csv_mapping_group.setVisible(True)
-                except Exception as e:
-                    self.show_error(f"Error processing CSV headers: {e}")
-                    self.log_message(f"CSV header processing error: {e}", logging.ERROR)
-                    self.log_message(traceback.format_exc(), logging.DEBUG)
-                    self.gps_file_path = None
-                    self.gps_path_display.clear()
-            elif not file_path.lower().endswith('.gpx'):
-                self.log_message(f"Unknown GPS file type: {os.path.splitext(file_path)[1]}", logging.WARNING)
-                self.show_error(f"Unsupported GPS file type: {os.path.splitext(file_path)[1]}. Please use GPX or CSV/TXT.")
-                self.gps_file_path = None
-                self.gps_path_display.clear()
+                    with open(file_path, 'r', errors='ignore') as csv_file:
+                        sample_lines = [
+                            line
+                            for line in (csv_file.readline() for _ in range(20))
+                            if line and line.strip()
+                        ]
+                        sample = "".join(sample_lines)
+                        if not sample:
+                            self.show_error(
+                                "CSV file appears to be empty or contains no valid data for sniffing."
+                            )
+                            clear_selected_gps()
+                            return
+                        dialect = csv.Sniffer().sniff(sample)
+                        delimiter = dialect.delimiter
+                        self.log_message(f"Detected delimiter: '{repr(delimiter)}'")
+                except csv.Error as sniff_err:
+                    self.log_message(
+                        f"Delimiter sniffing failed ({sniff_err}), using default ','.",
+                        logging.WARNING,
+                    )
+                except Exception as sniff_error:
+                    self.log_message(
+                        f"Error during delimiter sniffing setup ({sniff_error}), using default ','.",
+                        logging.WARNING,
+                    )
+                try:
+                    headers = pd.read_csv(
+                        file_path,
+                        sep=delimiter,
+                        nrows=0,
+                        engine='python',
+                        skipinitialspace=True,
+                        encoding_errors='ignore',
+                    ).columns.tolist()
+                except UnicodeDecodeError:
+                    self.log_message(
+                        "UnicodeDecodeError reading CSV headers with utf-8, trying latin-1",
+                        logging.WARNING,
+                    )
+                    headers = pd.read_csv(
+                        file_path,
+                        sep=delimiter,
+                        nrows=0,
+                        engine='python',
+                        skipinitialspace=True,
+                        encoding='latin-1',
+                        encoding_errors='ignore',
+                    ).columns.tolist()
+                except pd.errors.EmptyDataError:
+                    self.show_error("CSV file is empty or contains no data after headers.")
+                    clear_selected_gps()
+                    return
+                if not headers:
+                    self.show_error("Could not read headers from CSV file.")
+                    clear_selected_gps()
+                    return
+                self.log_message(f"CSV Headers found: {headers}")
+                for combo in [
+                    self.lat_col_combo,
+                    self.lon_col_combo,
+                    self.date_col_combo,
+                    self.time_col_combo,
+                    self.datetime_col_combo,
+                ]:
+                    combo.clear()
+                    combo.addItems(headers)
+                for widget in [
+                    self.lat_col_combo,
+                    self.lon_col_combo,
+                    self.datetime_format_input,
+                ]:
+                    widget.setEnabled(True)
+                self.guess_common_columns(headers)
+                self.csv_mapping_group.setVisible(True)
+            except Exception as csv_error:
+                self.show_error(f"Error processing CSV headers: {csv_error}")
+                self.log_message(f"CSV header processing error: {csv_error}", logging.ERROR)
+                self.log_message(traceback.format_exc(), logging.DEBUG)
+                clear_selected_gps()
+                return
 
-            self._run_preliminary_gps_parse_and_map()
-            self.update_transect_ui()
-            self.update_sync_method_ui()
+        self._run_preliminary_gps_parse_and_map()
+        self.update_transect_ui()
+        self.update_sync_method_ui()
 
     def load_media(self):
         if self.worker_thread and self.worker_thread.isRunning():
@@ -3188,11 +4813,15 @@ class GeoTaggerApp(QWidget):
             self.log_message(f"Image directory selected: {dir_path}")
             self.geotag_output_dir_base = f"geotagged_{os.path.basename(dir_path)}"
             self.geotag_images_button.setEnabled(False)
+            self.clear_folder_offset_analysis()
 
             self.log_message("Performing preliminary scan of image directory for sync purposes...")
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.preliminary_media_list = engine.get_image_files_and_times(self.media_path)
+                self._preliminary_media_path = os.path.normcase(
+                    os.path.abspath(self.media_path)
+                )
                 self.sync_image_info = None
                 self.sync_gps_point_info = None
                 self.log_message(f"Preliminary scan found {len(self.preliminary_media_list)} images.")
@@ -3200,6 +4829,7 @@ class GeoTaggerApp(QWidget):
                 self.log_message(f"Preliminary media scan failed: {e}", logging.ERROR)
                 self.show_error(f"Failed to scan image directory for times: {e}")
                 self.preliminary_media_list = []
+                self._preliminary_media_path = None
             finally:
                 QApplication.restoreOverrideCursor()
                 self.update_sync_method_ui()
@@ -3227,6 +4857,527 @@ class GeoTaggerApp(QWidget):
         self.time_col_label.setEnabled(not is_single and csv_is_visible)
         self.time_col_combo.setEnabled(not is_single and csv_is_visible)
         self.datetime_format_input.setEnabled(csv_is_visible)
+
+    def clear_folder_offset_analysis(self):
+        self.folder_time_offsets = {}
+        self.folder_offset_analysis = {}
+        if hasattr(self, 'folder_offset_table'):
+            self.folder_offset_table.setRowCount(0)
+        if hasattr(self, 'folder_offset_detail_label'):
+            self.folder_offset_detail_label.setText(
+                "No folder analysis yet. Suggestions will appear here without being enabled."
+            )
+        if hasattr(self, 'use_folder_offsets_checkbox'):
+            self.use_folder_offsets_checkbox.setChecked(False)
+
+    def _folder_offset_row(self, time_group):
+        for row in range(self.folder_offset_table.rowCount()):
+            item = self.folder_offset_table.item(row, 1)
+            if item and item.text() == time_group:
+                return row
+        return None
+
+    def _set_folder_offset_row(
+        self,
+        time_group,
+        offset_seconds,
+        image_count=None,
+        coverage_text="",
+        evidence="",
+        equal_score_range="",
+        use_offset=False,
+    ):
+        row = self._folder_offset_row(time_group)
+        if row is None:
+            row = self.folder_offset_table.rowCount()
+            self.folder_offset_table.insertRow(row)
+
+        if image_count is None:
+            image_count = sum(
+                1
+                for item in self.preliminary_media_list
+                if item.get('time_group', '.') == time_group
+            )
+
+        use_item = QTableWidgetItem()
+        use_item.setFlags(
+            (use_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            & ~Qt.ItemFlag.ItemIsEditable
+        )
+        use_item.setCheckState(
+            Qt.CheckState.Checked if use_offset else Qt.CheckState.Unchecked
+        )
+        self.folder_offset_table.setItem(row, 0, use_item)
+
+        if evidence.startswith("Exact selected"):
+            status_text = "Confirmed"
+            status_color = QColor("#15803d")
+        elif evidence.startswith("Shared continuous camera run"):
+            status_text = "Shared"
+            status_color = QColor("#0369a1")
+        elif "Ambiguous" in evidence:
+            status_text = "Review"
+            status_color = QColor("#b45309")
+        elif evidence.startswith("No"):
+            status_text = "No match"
+            status_color = QColor("#b91c1c")
+        else:
+            status_text = "Review"
+            status_color = QColor("#475569")
+
+        values = [
+            time_group,
+            f"{float(offset_seconds):.3f}",
+            coverage_text,
+            status_text,
+        ]
+        for column, value in enumerate(values, start=1):
+            table_item = QTableWidgetItem(str(value))
+            if column != 2:
+                table_item.setFlags(
+                    table_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                )
+            if column == 1:
+                table_item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    {
+                        "image_count": int(image_count),
+                        "evidence": evidence,
+                        "equal_score_range": equal_score_range,
+                    },
+                )
+            if column == 4:
+                table_item.setForeground(status_color)
+            self.folder_offset_table.setItem(row, column, table_item)
+
+        self.folder_time_offsets[time_group] = float(offset_seconds)
+        self.folder_offset_table.setCurrentCell(row, 1)
+        self._update_folder_offset_detail(row)
+
+    def _update_folder_offset_detail(
+        self,
+        current_row,
+        _current_column=0,
+        _previous_row=-1,
+        _previous_column=-1,
+    ):
+        if current_row < 0:
+            return
+        group_item = self.folder_offset_table.item(current_row, 1)
+        offset_item = self.folder_offset_table.item(current_row, 2)
+        coverage_item = self.folder_offset_table.item(current_row, 3)
+        if not group_item:
+            return
+        metadata = group_item.data(Qt.ItemDataRole.UserRole) or {}
+        self.folder_offset_detail_label.setText(
+            f"<b>{html.escape(group_item.text())}</b>  •  "
+            f"{metadata.get('image_count', 0):,} images  •  "
+            f"offset {html.escape(offset_item.text() if offset_item else 'N/A')} s<br>"
+            f"Coverage: {html.escape(coverage_item.text() if coverage_item else 'N/A')}<br>"
+            f"{html.escape(metadata.get('evidence', 'No evidence available'))}<br>"
+            f"Equal-score range: "
+            f"{html.escape(metadata.get('equal_score_range', 'Not available'))}"
+        )
+
+    def _folder_offsets_from_ui(self):
+        if not self.use_folder_offsets_checkbox.isChecked():
+            return {}
+
+        offsets = {}
+        for row in range(self.folder_offset_table.rowCount()):
+            use_item = self.folder_offset_table.item(row, 0)
+            group_item = self.folder_offset_table.item(row, 1)
+            offset_item = self.folder_offset_table.item(row, 2)
+            if not group_item or not offset_item:
+                continue
+            if not use_item or use_item.checkState() != Qt.CheckState.Checked:
+                continue
+            try:
+                offsets[group_item.text()] = float(offset_item.text())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid offset for folder '{group_item.text()}': "
+                    f"{offset_item.text()}"
+                ) from exc
+        return offsets
+
+    def analyze_folder_time_offsets(self):
+        if (
+            not self.preliminary_media_list
+            or self.preliminary_gps_df is None
+            or self.preliminary_gps_df.empty
+        ):
+            self.show_error("Load both the GPS logs and image directory first.")
+            return
+
+        groups = {}
+        for item in self.preliminary_media_list:
+            image_time = item.get('image_time')
+            if image_time is not None:
+                groups.setdefault(item.get('time_group', '.'), []).append(image_time)
+
+        if not groups:
+            self.show_error("No camera timestamps were available to analyze.")
+            return
+
+        self.clear_folder_offset_analysis()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            timed_gps_df = _timed_gps_df(self.preliminary_gps_df)
+            if self.preserve_camera_clock_checkbox.isChecked():
+                camera_chains = _continuous_camera_group_chains(groups)
+            else:
+                camera_chains = [
+                    [group_and_times]
+                    for group_and_times in sorted(
+                        groups.items(),
+                        key=lambda group_and_times: (
+                            min(group_and_times[1]),
+                            group_and_times[0].casefold(),
+                        ),
+                    )
+                ]
+
+            for camera_chain in camera_chains:
+                combined_image_times = [
+                    image_time
+                    for _, image_times in camera_chain
+                    for image_time in image_times
+                ]
+                shared_analysis = engine.analyze_camera_time_offset(
+                    combined_image_times,
+                    timed_gps_df,
+                    timezone_str=self.current_timezone_str,
+                    search_hours=4,
+                    max_gap_seconds=30,
+                )
+                chain_names = [name for name, _ in camera_chain]
+                chain_label = " → ".join(chain_names)
+                shared_suggested = shared_analysis.get(
+                    'suggested_offset_seconds'
+                )
+
+                for time_group, image_times in camera_chain:
+                    analysis = dict(shared_analysis)
+                    if len(camera_chain) > 1 and shared_suggested is not None:
+                        matched, image_count = (
+                            engine.count_camera_time_offset_coverage(
+                                image_times,
+                                timed_gps_df,
+                                shared_suggested,
+                                timezone_str=self.current_timezone_str,
+                                max_gap_seconds=30,
+                            )
+                        )
+                        coverage = (
+                            matched / image_count if image_count else 0.0
+                        )
+                        combined_matched = shared_analysis.get(
+                            'matched_count',
+                            0,
+                        )
+                        combined_count = shared_analysis.get(
+                            'image_count',
+                            len(combined_image_times),
+                        )
+                        combined_coverage = (
+                            combined_matched / combined_count
+                            if combined_count
+                            else 0.0
+                        )
+                        analysis.update(
+                            {
+                                "matched_count": int(matched),
+                                "image_count": int(image_count),
+                                "coverage_fraction": float(coverage),
+                                "evidence": (
+                                    "Shared continuous camera run: "
+                                    f"{chain_label}. One offset was scored using "
+                                    f"all {combined_count:,} images "
+                                    f"({combined_matched:,} GPS matches, "
+                                    f"{combined_coverage:.1%}); this folder has "
+                                    f"{matched:,}/{image_count:,}. "
+                                    "Short-folder alternatives were not treated "
+                                    "as independent camera-clock changes."
+                                ),
+                                "shared_camera_run_groups": chain_names,
+                                "shared_camera_run_matched_count": int(
+                                    combined_matched
+                                ),
+                                "shared_camera_run_image_count": int(
+                                    combined_count
+                                ),
+                            }
+                        )
+                    self.folder_offset_analysis[time_group] = analysis
+                    suggested = analysis.get('suggested_offset_seconds')
+                    matched = analysis.get('matched_count', 0)
+                    image_count = analysis.get(
+                        'image_count',
+                        len(image_times),
+                    )
+                    coverage = analysis.get('coverage_fraction', 0.0)
+                    range_min = analysis.get('best_offset_min_seconds')
+                    range_max = analysis.get('best_offset_max_seconds')
+                    range_text = (
+                        f"{range_min:+d} to {range_max:+d}"
+                        if range_min is not None and range_max is not None
+                        else "No overlap"
+                    )
+                    self._set_folder_offset_row(
+                        time_group,
+                        (
+                            suggested
+                            if suggested is not None
+                            else self.offset_spinbox.value()
+                        ),
+                        image_count=image_count,
+                        coverage_text=(
+                            f"{matched:,}/{image_count:,} ({coverage:.1%})"
+                        ),
+                        evidence=analysis.get('evidence', ''),
+                        equal_score_range=range_text,
+                        use_offset=False,
+                    )
+                    self.log_message(
+                        f"Folder '{time_group}': suggested offset "
+                        f"{suggested if suggested is not None else 'none'} s; "
+                        f"GPS coverage {matched:,}/{image_count:,}; "
+                        f"equal-score range {range_text}; "
+                        f"{analysis.get('evidence', '')}",
+                        logging.INFO,
+                    )
+                    QApplication.processEvents()
+
+            self.use_folder_offsets_checkbox.setChecked(True)
+            self.folder_offset_note.setText(
+                "Suggestions are ready but unchecked. 'Shared' means nearby "
+                "folders were scored together as one continuous camera clock. "
+                "Select a row for evidence and use Visual Sync to confirm."
+            )
+        except Exception as exc:
+            self.log_message(
+                f"Folder offset analysis failed: {exc}",
+                logging.ERROR,
+            )
+            self.log_message(traceback.format_exc(), logging.DEBUG)
+            self.show_error(f"Could not analyze folder offsets: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.update_sync_method_ui()
+
+    def review_selected_folder_sequence(self):
+        if not self.preliminary_media_list:
+            self.show_error("Load an image directory before reviewing a sequence.")
+            return
+
+        time_group = None
+        selected_row = self.folder_offset_table.currentRow()
+        if selected_row >= 0:
+            group_item = self.folder_offset_table.item(selected_row, 1)
+            if group_item:
+                time_group = group_item.text()
+
+        available_groups = sorted(
+            {
+                item.get('time_group', '.')
+                for item in self.preliminary_media_list
+                if item.get('image_time') is not None
+            },
+            key=str.casefold,
+        )
+        if time_group is None and len(available_groups) == 1:
+            time_group = available_groups[0]
+        if time_group is None:
+            self.show_error(
+                "Analyze the folder offsets, then select the camera folder "
+                "you want to review."
+            )
+            return
+
+        group_items = [
+            item
+            for item in self.preliminary_media_list
+            if item.get('time_group', '.') == time_group
+            and item.get('image_time') is not None
+            and item.get('file_path')
+        ]
+        if not group_items:
+            self.show_error(
+                f"No timestamped photos were available for folder '{time_group}'."
+            )
+            return
+
+        offset_analysis = self.folder_offset_analysis.get(time_group) or {}
+        dialog = SequenceReviewDialog(
+            group_items,
+            time_group,
+            self.current_timezone_str,
+            offset_analysis=offset_analysis,
+            display_name=(
+                os.path.basename(os.path.normpath(self.media_path))
+                if time_group == "." and self.media_path
+                else time_group
+            ),
+            parent=self,
+        )
+        if (
+            dialog.exec() == QDialog.DialogCode.Accepted
+            and dialog.selected_item is not None
+        ):
+            self.sync_visual_radio.setChecked(True)
+            self._set_sync_image_item(dialog.selected_item)
+            self.workflow_tabs.setCurrentIndex(0)
+            self.output_tabs.setCurrentWidget(self.map_view)
+            QTimer.singleShot(
+                0,
+                lambda: self.setup_scroll.ensureWidgetVisible(
+                    self.visual_sync_group,
+                    20,
+                    20,
+                ),
+            )
+            self.visual_sync_status_label.setText(
+                "Status: Sequence frame selected. Click the matching boat-entry "
+                "point on the GPS map."
+            )
+            QTimer.singleShot(
+                350,
+                lambda item=dialog.selected_item, analysis=offset_analysis:
+                    self._focus_visual_sync_candidate_range(item, analysis),
+            )
+            self.log_message(
+                f"Sequence review selected "
+                f"'{os.path.basename(dialog.selected_item['file_path'])}' "
+                f"from folder '{time_group}' for Visual Sync.",
+                logging.INFO,
+            )
+
+    def _focus_visual_sync_candidate_range(self, selected_item, offset_analysis):
+        """Highlight every GPS point allowed by the equal-score offset range."""
+        image_time = selected_item.get('image_time') if selected_item else None
+        range_min = offset_analysis.get('best_offset_min_seconds')
+        range_max = offset_analysis.get('best_offset_max_seconds')
+        if image_time is None or range_min is None or range_max is None:
+            self.visual_sync_status_label.setText(
+                "Status: Photo selected. No analyzed timing range is available; "
+                "find and click the matching point on the map."
+            )
+            return
+        if (
+            self._map_file_path is None
+            or not os.path.exists(self._map_file_path)
+            or not (self.map_view and self.map_view.page())
+        ):
+            self.visual_sync_status_label.setText(
+                "Status: Photo selected, but the GPS map is not ready."
+            )
+            return
+
+        try:
+            local_timezone = pytz.timezone(self.current_timezone_str)
+            image_local = pd.Timestamp(image_time)
+            if image_local.tzinfo is None:
+                image_local = pd.Timestamp(
+                    local_timezone.localize(
+                        image_local.to_pydatetime(),
+                        is_dst=None,
+                    )
+                )
+            else:
+                image_local = image_local.tz_convert(local_timezone)
+            image_utc = image_local.tz_convert("UTC")
+            candidate_start = image_utc + pd.Timedelta(
+                seconds=min(float(range_min), float(range_max))
+            )
+            candidate_end = image_utc + pd.Timedelta(
+                seconds=max(float(range_min), float(range_max))
+            )
+            start_iso = candidate_start.isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z')
+            end_iso = candidate_end.isoformat(
+                timespec='milliseconds'
+            ).replace('+00:00', 'Z')
+            js_call = (
+                f"focusGpsTimeWindow({json.dumps(start_iso)}, "
+                f"{json.dumps(end_iso)});"
+            )
+
+            def update_candidate_status(point_count):
+                try:
+                    point_count = int(point_count or 0)
+                except (TypeError, ValueError):
+                    point_count = 0
+                if point_count:
+                    self.visual_sync_status_label.setText(
+                        f"Status: {point_count:,} candidate GPS points are amber. "
+                        "Match the selected water-entry photo to the shoreline, "
+                        "then click that point."
+                    )
+                else:
+                    self.visual_sync_status_label.setText(
+                        "Status: No GPS points fall inside this analyzed offset "
+                        "range. Try another frame or re-run the offset analysis."
+                    )
+
+            self.map_view.page().runJavaScript(
+                js_call,
+                update_candidate_status,
+            )
+            self.log_message(
+                "Visual Sync candidate map range: "
+                f"{start_iso} to {end_iso} "
+                f"(offsets {range_min:+d} to {range_max:+d} s).",
+                logging.INFO,
+            )
+        except (
+            ValueError,
+            TypeError,
+            pytz.AmbiguousTimeError,
+            pytz.NonExistentTimeError,
+        ) as error:
+            self.log_message(
+                f"Could not focus the Visual Sync candidate range: {error}",
+                logging.WARNING,
+            )
+            self.visual_sync_status_label.setText(
+                "Status: Photo selected, but its candidate GPS range could not "
+                "be calculated."
+            )
+
+    def _apply_visual_sync_calibration(self):
+        if not self.sync_image_info or not self.sync_gps_point_info:
+            return
+        try:
+            image_local = pytz.timezone(self.current_timezone_str).localize(
+                self.sync_image_info['timestamp'],
+                is_dst=None,
+            )
+            gps_utc = self.sync_gps_point_info['timestamp']
+            offset_seconds = (gps_utc - image_local).total_seconds()
+            time_group = self.sync_image_info.get('time_group', '.')
+            self._set_folder_offset_row(
+                time_group,
+                offset_seconds,
+                coverage_text="Visually confirmed pair",
+                evidence="Exact selected image/map correspondence",
+                equal_score_range=f"{offset_seconds:+.3f}",
+                use_offset=True,
+            )
+            self.use_folder_offsets_checkbox.setChecked(True)
+            self.log_message(
+                f"Visual calibration stored for folder '{time_group}': "
+                f"{offset_seconds:+.3f} s.",
+                logging.INFO,
+            )
+            self.sync_manual_radio.setChecked(True)
+            self.folder_offset_note.setText(
+                f"'{time_group}' is visually calibrated and enabled. "
+                "Other folder rows are unchanged."
+            )
+        except Exception as exc:
+            self.show_error(f"Could not calculate visual sync offset: {exc}")
 
     def update_sync_method_ui(self):
         if not hasattr(self, 'sync_manual_radio'):
@@ -3274,8 +5425,6 @@ class GeoTaggerApp(QWidget):
                 self.visual_sync_status_label.setText(
                     "Status: Sync point selected. Ready to process."
                 )
-                # print (and log) the offset so you can type it in manually
-                import pytz
                 # localize the image timestamp to UI timezone:
                 img_local = pytz.timezone(self.current_timezone_str) \
                                  .localize(self.sync_image_info['timestamp'])
@@ -3287,7 +5436,6 @@ class GeoTaggerApp(QWidget):
 
                                 # auto-calculate manual‐offset from the two timestamps,
                 # fill the spin‐box and switch to Manual mode
-                import pytz
                 # 1) localize the image’s naive timestamp
                 img_dt_local = pytz.timezone(self.current_timezone_str) \
                                   .localize(self.sync_image_info['timestamp'])
@@ -3316,41 +5464,85 @@ class GeoTaggerApp(QWidget):
 
         # finally, show/hide the whole Visual‐Sync group box
         self.visual_sync_group.setVisible(is_visual)
+        can_analyze_offsets = bool(self.preliminary_media_list) and (
+            self.preliminary_gps_df is not None
+            and not self.preliminary_gps_df.empty
+        )
+        self.analyze_folder_offsets_button.setEnabled(can_analyze_offsets)
+        self.review_sequence_button.setEnabled(bool(self.preliminary_media_list))
 
+
+    def _set_sync_image_item(self, selected_item_info):
+        if (
+            not selected_item_info
+            or selected_item_info.get('image_time') is None
+            or not selected_item_info.get('file_path')
+        ):
+            return False
+
+        self.sync_image_info = {
+            'path': selected_item_info['file_path'],
+            'timestamp': selected_item_info['image_time'],
+            'time_group': selected_item_info.get('time_group', '.'),
+        }
+        image_local = pytz.timezone(self.current_timezone_str).localize(
+            self.sync_image_info['timestamp'],
+            is_dst=None,
+        )
+        self.sync_image_time_display.setText(
+            self.format_datetime_for_display(image_local)
+        )
+
+        pixmap = QPixmap(self.sync_image_info['path'])
+        if not pixmap.isNull():
+            self.sync_image_preview_label.setPixmap(
+                pixmap.scaled(
+                    self.sync_image_preview_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        else:
+            self.sync_image_preview_label.setText("Preview\nNot\nAvailable")
+
+        self.sync_gps_point_info = None
+        self.sync_gps_point_time_display.setText("N/A - Click on map")
+        self.sync_gps_point_coords_display.setText("N/A - Click on map")
+        self.update_sync_method_ui()
+        return True
 
     def select_image_for_sync(self):
         if not self.preliminary_media_list:
             self.show_error("No images have been loaded. Please load an image directory first.")
             return
 
-        image_filenames = [os.path.basename(item['file_path']) for item in self.preliminary_media_list if item.get('file_path')]
-        chosen_filename, ok = QInputDialog.getItem(self, "Select Sync Image",
-                                                   "Choose an image from the loaded directory:",
-                                                   image_filenames, 0, False)
+        choices = []
+        items_by_choice = {}
+        for item in self.preliminary_media_list:
+            file_path = item.get('file_path')
+            if not file_path:
+                continue
+            label = (
+                os.path.relpath(file_path, self.media_path)
+                if self.media_path
+                else file_path
+            )
+            choices.append(label)
+            items_by_choice[label] = item
+        chosen_filename, ok = QInputDialog.getItem(
+            self,
+            "Select Sync Image",
+            "Choose an image from the loaded directory:",
+            choices,
+            0,
+            False,
+        )
 
         if ok and chosen_filename:
-            selected_item_info = next((item for item in self.preliminary_media_list if os.path.basename(item.get('file_path', '')) == chosen_filename), None)
+            selected_item_info = items_by_choice.get(chosen_filename)
 
             if selected_item_info and 'image_time' in selected_item_info and selected_item_info['image_time'] is not None:
-                self.sync_image_info = {
-                    'path': selected_item_info['file_path'],
-                    'timestamp': selected_item_info['image_time'] # Naive datetime
-                }
-                local_tz_time = self.format_datetime_for_display(pytz.timezone(self.current_timezone_str).localize(self.sync_image_info['timestamp']))
-                self.sync_image_time_display.setText(local_tz_time)
-
-                pixmap = QPixmap(self.sync_image_info['path'])
-                if not pixmap.isNull():
-                    self.sync_image_preview_label.setPixmap(pixmap.scaled(self.sync_image_preview_label.size(),
-                                                                           Qt.AspectRatioMode.KeepAspectRatio,
-                                                                           Qt.TransformationMode.SmoothTransformation))
-                else:
-                    self.sync_image_preview_label.setText("Preview\nNot\nAvailable")
-
-                self.sync_gps_point_info = None
-                self.sync_gps_point_time_display.setText("N/A - Click on map")
-                self.sync_gps_point_coords_display.setText("N/A - Click on map")
-                self.update_sync_method_ui()
+                self._set_sync_image_item(selected_item_info)
             else:
                 self.show_error(f"The selected image '{chosen_filename}' is missing a valid timestamp. Please choose another.")
                 self.sync_image_info = None
@@ -3420,21 +5612,29 @@ class GeoTaggerApp(QWidget):
 
     def on_worker_error(self, message):
         self.log_message(f"Worker thread encountered an error: {message}", logging.ERROR)
+        self._awaiting_worker_map = False
         self.show_error(f"Processing Error Occurred:\n{message}")
         self.process_button.setEnabled(True)
         if self.worker_thread:
-            self.worker_thread.quit()
-            if not self.worker_thread.wait(500):
-                self.worker_thread.terminate()
-                self.worker_thread.wait()
-            self.worker_thread.deleteLater()
-            self.worker_thread = None
+            self.worker_thread.requestInterruption()
+            if self.worker_thread.wait(2000):
+                self.worker_thread.deleteLater()
+                self.worker_thread = None
+            else:
+                self.log_message(
+                    "Worker is still finishing cleanup after the error; it was not force-terminated.",
+                    logging.WARNING,
+                )
         self.update_transect_ui()
         self._update_batch_processing_ui_states()
 
     def on_worker_finished(self):
         self.log_message("Worker thread has finished signal received.", logging.INFO)
+        needs_fallback_map = self._awaiting_worker_map
+        self._awaiting_worker_map = False
         if self.worker_thread:
+            if self._close_when_worker_stops and self.worker_thread.map_file:
+                self._stale_temp_map_paths.add(self.worker_thread.map_file)
             self.worker_thread.deleteLater()
             self.worker_thread = None
         # Only re-enable process button if progress is not 100 (implies error or early finish)
@@ -3443,21 +5643,58 @@ class GeoTaggerApp(QWidget):
             self.process_button.setEnabled(True)
         self.update_transect_ui()
         self._update_batch_processing_ui_states()
+        if self._close_when_worker_stops:
+            self._close_when_worker_stops = False
+            QTimer.singleShot(0, self.close)
+        elif needs_fallback_map:
+            self.log_message("Worker did not publish a map; generating a fallback map.", logging.WARNING)
+            self.regenerate_map_display()
+
+    @staticmethod
+    def _is_temporary_map_file(path):
+        if not path:
+            return False
+        basename = os.path.basename(path)
+        return basename.startswith(("geotagger_map_app_", "geotagger_map_worker_"))
+
+    def _remove_temporary_map_file(self, path):
+        if not self._is_temporary_map_file(path) or not os.path.exists(path):
+            self._stale_temp_map_paths.discard(path)
+            return
+        try:
+            os.remove(path)
+            self._stale_temp_map_paths.discard(path)
+            self.log_message(f"Removed temporary map file: {path}", logging.DEBUG)
+        except OSError as remove_error:
+            self.log_message(f"Error removing temporary map file '{path}': {remove_error}", logging.WARNING)
+
+    def _cleanup_previous_map_after_load(self, previous_map_path):
+        if not self._is_temporary_map_file(previous_map_path):
+            return
+        self._stale_temp_map_paths.add(previous_map_path)
+
+        def cleanup_previous_map(_load_succeeded):
+            try:
+                self.map_view.loadFinished.disconnect(cleanup_previous_map)
+            except (TypeError, RuntimeError):
+                pass
+            self._remove_temporary_map_file(previous_map_path)
+
+        self.map_view.loadFinished.connect(cleanup_previous_map)
 
     def display_map(self, map_html_path):
         self.log_message(f"Attempting to display map: {map_html_path}")
-        self._map_file_path = map_html_path
         if map_html_path and os.path.exists(map_html_path):
             try:
                 abs_path = os.path.abspath(map_html_path)
                 url = QUrl.fromLocalFile(abs_path)
                 if url.isValid() and url.scheme() == 'file':
-                    try:
-                        QWebEngineProfile.defaultProfile().clearHttpCache()
-                        self.log_message("Cleared WebEngine HTTP cache.", logging.DEBUG)
-                    except Exception as e:
-                        self.log_message(f"Could not clear WebEngine cache: {e}", logging.WARNING)
+                    previous_map_path = self._map_file_path
+                    if previous_map_path and os.path.abspath(previous_map_path) != abs_path:
+                        self._cleanup_previous_map_after_load(previous_map_path)
                     self.map_view.setUrl(url)
+                    self._map_file_path = abs_path
+                    self._awaiting_worker_map = False
                     self.save_map_button.setEnabled(True)
                     self.log_message("Map loaded successfully.")
                     self.output_tabs.setCurrentWidget(self.map_view)
@@ -3465,19 +5702,19 @@ class GeoTaggerApp(QWidget):
                     err_msg = f"Invalid map URL generated: {url.errorString() if not url.isValid() else 'Scheme not file'}"
                     self.log_message(err_msg, logging.ERROR)
                     if self.map_view and self.map_view.page():
-                        self.map_view.setHtml(f"<h2>Map Error</h2><p>{err_msg}</p>")
+                        self.map_view.setHtml(f"<h2>Map Error</h2><p>{html.escape(err_msg)}</p>")
                     self.save_map_button.setEnabled(False)
             except Exception as e:
                 self.log_message(f"Error displaying map: {e}", logging.ERROR)
                 self.log_message(traceback.format_exc(), logging.DEBUG)
                 if self.map_view and self.map_view.page():
-                    self.map_view.setHtml(f"<h2>Map Error</h2><p>Failed to load map view: {e}</p>")
+                    self.map_view.setHtml(f"<h2>Map Error</h2><p>Failed to load map view: {html.escape(str(e))}</p>")
                 self.save_map_button.setEnabled(False)
         else:
             msg = f"Map display failed: Path invalid or file not found ('{map_html_path}')."
             self.log_message(msg, logging.WARNING)
             if self.map_view and self.map_view.page():
-                 self.map_view.setHtml(f"<h2>Map Error</h2><p>{msg}</p>")
+                 self.map_view.setHtml(f"<h2>Map Error</h2><p>{html.escape(msg)}</p>")
             self.save_map_button.setEnabled(False)
 
     def start_processing(self):
@@ -3485,8 +5722,20 @@ class GeoTaggerApp(QWidget):
         if not ENGINE_AVAILABLE:
             self.show_error("Georeference engine (georeference_engine.py) not loaded.")
             return
-        if not self.gps_file_path or not os.path.exists(self.gps_file_path):
-            self.show_error("Load GPS file first.")
+        selected_gps_paths = self.gps_file_paths or (
+            [self.gps_file_path] if self.gps_file_path else []
+        )
+        missing_gps_paths = [
+            path for path in selected_gps_paths if not os.path.exists(path)
+        ]
+        if not selected_gps_paths:
+            self.show_error("Load a GPS track or TLOG file first.")
+            return
+        if missing_gps_paths:
+            self.show_error(
+                "One or more selected GPS files no longer exist:\n"
+                + "\n".join(missing_gps_paths)
+            )
             return
 
         # --- Determine Sync Method and Params ---
@@ -3528,10 +5777,40 @@ class GeoTaggerApp(QWidget):
             sync_params["gopro_sync_time"] = self.sync_image_info['timestamp'] # Naive datetime
             sync_params["gps_sync_time"] = self.sync_gps_point_info['timestamp'] # UTC datetime
 
+        try:
+            folder_time_offsets = self._folder_offsets_from_ui()
+        except ValueError as exc:
+            self.show_error(str(exc))
+            return
+
         # --- Get GPS Parsing Params ---
         gps_params = self._get_gps_parsing_params_from_ui()
         if not gps_params:
             return # Error was already shown in helper function
+
+        current_gps_cache_key = _gps_parse_cache_key(
+            self.gps_file_path,
+            gps_params,
+        )
+        preloaded_gps_df = None
+        if (
+            self.preliminary_gps_df is not None
+            and not self.preliminary_gps_df.empty
+            and self._preliminary_gps_cache_key == current_gps_cache_key
+        ):
+            preloaded_gps_df = self.preliminary_gps_df
+
+        normalized_media_path = (
+            os.path.normcase(os.path.abspath(self.media_path))
+            if self.media_path
+            else None
+        )
+        preloaded_media_items = None
+        if (
+            normalized_media_path
+            and normalized_media_path == self._preliminary_media_path
+        ):
+            preloaded_media_items = self.preliminary_media_list
 
         # --- Reset state and start worker ---
         self.media_type = 'images' if self.media_path and os.path.isdir(self.media_path) else None
@@ -3555,6 +5834,7 @@ class GeoTaggerApp(QWidget):
             return
 
         self.process_button.setEnabled(False)
+        self._awaiting_worker_map = True
         QApplication.processEvents()
 
         self.worker_thread = WorkerThread(
@@ -3562,9 +5842,11 @@ class GeoTaggerApp(QWidget):
             gps_parsing_params=gps_params,
             media_path=self.media_path,
             media_type=self.media_type,
-            frame_interval=0,
             sync_method=sync_method,
-            sync_params=sync_params
+            sync_params=sync_params,
+            folder_time_offsets=folder_time_offsets,
+            preloaded_gps_df=preloaded_gps_df,
+            preloaded_media_items=preloaded_media_items,
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.log_message.connect(lambda msg: self.log_message(msg, logging.INFO))
@@ -3591,8 +5873,10 @@ class GeoTaggerApp(QWidget):
             return None
         try:
             # Ensure times are UTC and datetime objects
-            if isinstance(start_time_utc, str): start_time_utc = datetime.fromisoformat(start_time_utc.replace("Z", "+00:00"))
-            if isinstance(end_time_utc, str): end_time_utc = datetime.fromisoformat(end_time_utc.replace("Z", "+00:00"))
+            if isinstance(start_time_utc, str):
+                start_time_utc = datetime.fromisoformat(start_time_utc.replace("Z", "+00:00"))
+            if isinstance(end_time_utc, str):
+                end_time_utc = datetime.fromisoformat(end_time_utc.replace("Z", "+00:00"))
 
             if start_time_utc.tzinfo is None or start_time_utc.tzinfo.utcoffset(start_time_utc) is None:
                  start_time_utc = pytz.utc.localize(start_time_utc)
@@ -3735,6 +6019,8 @@ class GeoTaggerApp(QWidget):
 
             # --- Save the images for this named transect ---
             safe_transect_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in transect_name_input).strip()
+            if not safe_transect_name:
+                safe_transect_name = suggested_transect_name
             specific_transect_output_dir = os.path.join(transects_output_parent_dir, safe_transect_name)
             os.makedirs(specific_transect_output_dir, exist_ok=True)
 
@@ -3745,7 +6031,16 @@ class GeoTaggerApp(QWidget):
                     source_path = self.identifier_to_path_map.get(identifier)
                     if source_path and os.path.exists(source_path):
                         try:
-                            shutil.copy2(source_path, specific_transect_output_dir)
+                            copy_result = copy_file_safely(
+                                source_path,
+                                specific_transect_output_dir,
+                                source_root=self.media_path,
+                            )
+                            if copy_result.renamed_for_collision:
+                                self.log_message(
+                                    f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                    logging.INFO,
+                                )
                             copy_ok_count += 1
                         except Exception as copy_e:
                             self.log_message(f"Error copying image ID '{identifier}' for transect '{safe_transect_name}': {copy_e}", logging.ERROR)
@@ -3910,18 +6205,24 @@ class GeoTaggerApp(QWidget):
             try:
                 if has_valid_gps:
                     mean_lat, mean_lon = valid_gps_df_map['latitude'].mean(), valid_gps_df_map['longitude'].mean()
-                    if pd.notna(mean_lat) and pd.notna(mean_lon): center, zoom = [mean_lat, mean_lon], 15
+                    if pd.notna(mean_lat) and pd.notna(mean_lon):
+                        center, zoom = [mean_lat, mean_lon], 15
                 elif has_valid_results: # Fallback to results if no GPS
                     mean_lat, mean_lon = valid_results_df_map['Latitude'].mean(), valid_results_df_map['Longitude'].mean()
-                    if pd.notna(mean_lat) and pd.notna(mean_lon): center, zoom = [mean_lat, mean_lon], 15
+                    if pd.notna(mean_lat) and pd.notna(mean_lon):
+                        center, zoom = [mean_lat, mean_lon], 15
             except Exception as e:
                 self.log_message(f"[App] Error calculating map center: {e}", logging.WARNING)
 
-            m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap", control_scale=True)
-            folium.TileLayer(
-                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                attr='Tiles © Esri', name='Esri Satellite', overlay=False, control=True
-            ).add_to(m)
+            m = folium.Map(
+                location=center,
+                zoom_start=zoom,
+                tiles=None,
+                control_scale=True,
+                prefer_canvas=True,
+                max_zoom=21,
+            )
+            _add_imagery_basemaps(m)
 
             js_code_for_map = """
     <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
@@ -3947,14 +6248,50 @@ function highlightTransectRange(timestamps) {
         if (layer.options && layer.options.customTimestamp) { // Check if it's a GPS point marker
             var isHl = timestamps.indexOf(layer.options.customTimestamp) !== -1;
             layer.setStyle({
-                color: isHl? 'lime':'blue', // Highlighted vs default GPS point color
-                fillColor: isHl? 'lime':'blue',
+                color: isHl? 'lime':'#1261ff', // Highlighted vs default GPS point color
+                fillColor: isHl? 'lime':'#1261ff',
                 fillOpacity: isHl? 0.9:0.6,
                 weight: isHl? 3:1 // Thicker if highlighted
             });
             if (layer.setRadius) layer.setRadius(isHl? 6:4); // Larger if highlighted
         }
     });
+}
+function focusGpsTimeWindow(startIso, endIso) {
+    var map = Object.values(window).find(x => x instanceof L.Map);
+    if (!map) return 0;
+    var startMs = Date.parse(startIso);
+    var endMs = Date.parse(endIso);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return 0;
+    var lowerMs = Math.min(startMs, endMs);
+    var upperMs = Math.max(startMs, endMs);
+    var candidateBounds = [];
+    map.eachLayer(function(layer) {
+        if (layer.options && layer.options.customTimestamp) {
+            var pointMs = Date.parse(layer.options.customTimestamp);
+            var isCandidate = Number.isFinite(pointMs)
+                && pointMs >= lowerMs && pointMs <= upperMs;
+            layer.setStyle({
+                color: isCandidate ? '#ffb000' : '#1261ff',
+                fillColor: isCandidate ? '#ffb000' : '#1261ff',
+                fillOpacity: isCandidate ? 0.95 : 0.48,
+                weight: isCandidate ? 3 : 1
+            });
+            if (layer.setRadius) layer.setRadius(isCandidate ? 6 : 4);
+            if (isCandidate && layer.getLatLng) {
+                candidateBounds.push(layer.getLatLng());
+            }
+        }
+    });
+    if (candidateBounds.length === 1) {
+        map.setView(candidateBounds[0], 18);
+    } else if (candidateBounds.length > 1) {
+        map.fitBounds(L.latLngBounds(candidateBounds), {
+            padding: [48, 48],
+            maxZoom: 18
+        });
+    }
+    return candidateBounds.length;
 }
 // This now only handles the temporary YELLOW line during definition
 function drawTransectLine(lat1, lon1, lat2, lon2) {
@@ -3965,7 +6302,7 @@ function drawTransectLine(lat1, lon1, lat2, lon2) {
     }
     window.transectLine = L.polyline([[lat1, lon1], [lat2, lon2]], { color: 'yellow', weight: 2, interactive: false }).addTo(map);
 }
-// NEW FUNCTION: Draws a permanent ORANGE line for a saved transect
+// Draw a permanent orange line for a saved transect.
 function drawSavedTransectLine(lat1, lon1, lat2, lon2, name) {
     var map = Object.values(window).find(x => x instanceof L.Map);
     if (!map) return;
@@ -4050,40 +6387,18 @@ function clearAllSavedTransectLines() {
             m.get_root().html.add_child(folium.Element(extra_click_binding))
 
             if has_valid_gps:
-                gps_group = folium.FeatureGroup(name="GPS Track (Click for Transect)", show=True, overlay=True).add_to(m)
-                for _, (ts, row) in enumerate(valid_gps_df_map.iterrows()):
-                    marker_options = {}
-                    marker_color = 'blue'
-                    marker_fill = 'blue'
-                    tooltip = GPS_TIME_NOT_IDENTIFIED
-                    if _gps_timestamp_identified(ts):
-                        ts_iso = ts.isoformat(timespec='milliseconds').replace('+00:00','Z')
-                        ts_tip = ts.strftime('%H:%M:%S.%f')[:-3] + 'Z'
-                        js_call = f"sendClickedGpsTimestampToPython('{ts_iso}',event.ctrlKey,event.shiftKey); var m=null;for(var k in window){{if(window[k] instanceof L.Map){{m=window[k];break;}}}} if(m){{m.closePopup();}};"
-                        escaped_js = js_call.replace('"', '&quot;')
-                        popup_html = (f'<b>GPS Point</b><br>'
-                                      f'Time: {ts_tip}<br>'
-                                      f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                                      f'<button type="button" onclick="{escaped_js}">Select This Point</button>')
-                        tooltip = f"Click to open: {ts_tip}"
-                        marker_options = {'customTimestamp': ts_iso}
-                    else:
-                        marker_color = 'gray'
-                        marker_fill = 'gray'
-                        popup_html = (f'<b>GPS Point</b><br>'
-                                      f'<b>{GPS_TIME_NOT_IDENTIFIED}</b><br>'
-                                      f'Lat: {row["latitude"]:.6f}, Lon: {row["longitude"]:.6f}<br>'
-                                      'This point cannot be used for time-based transects.')
-                    folium.CircleMarker([row['latitude'],row['longitude']], radius=4, color=marker_color, weight=1, fill=True, fill_color=marker_fill, fill_opacity=0.6,
-                                        popup=folium.Popup(popup_html, max_width=250), tooltip=tooltip,
-                                        options=marker_options).add_to(gps_group)
+                _add_compact_gps_marker_layer(
+                    m,
+                    valid_gps_df_map,
+                    self.current_timezone_str,
+                )
+                _add_gps_session_start_layer(
+                    m,
+                    valid_gps_df_map,
+                    self.current_timezone_str,
+                )
             if has_valid_results:
-                img_group = folium.plugins.MarkerCluster(name="Images", show=True, overlay=True).add_to(m)
-                for _, row in valid_results_df_map.iterrows():
-                    ts_dt = row['TS_dt'] # Already converted to datetime, should be UTC
-                    popup = f"ID:{row['Identifier']}<br>Time:{ts_dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ' Z' if pd.notna(ts_dt) else 'N/A'}<br>Lat:{row['Latitude']:.7f},Lon:{row['Longitude']:.7f}"
-                    folium.CircleMarker([row['Latitude'], row['Longitude']], radius=4, color='red', weight=1, fill=True, fill_color='red', fill_opacity=0.7,
-                                        popup=folium.Popup(popup, max_width=300), tooltip=f"Img: {row['Identifier']}").add_to(img_group)
+                _add_compact_image_marker_layer(m, valid_results_df_map)
 
             if hasattr(self, 'saved_transects') and self.saved_transects:
                 saved_lines_group = folium.FeatureGroup(name="Saved Session Transects", show=True, overlay=True).add_to(m)
@@ -4126,11 +6441,21 @@ function clearAllSavedTransectLines() {
             return
         self.results_table.blockSignals(True)
         self.results_table.setSortingEnabled(False)
+        self.results_table.setUpdatesEnabled(False)
         self.results_table.clearSelection()
         self.results_table.clearContents()
         self.results_table.setRowCount(0)
         self.extract_button.setEnabled(False)
-        target_hdrs = ["Identifier", "File Path", "Original Timestamp", "Corrected Timestamp (UTC)", "Latitude", "Longitude"]
+        target_hdrs = [
+            "Identifier",
+            "File Path",
+            "Camera Group",
+            "Applied Offset (seconds)",
+            "Original Timestamp",
+            "Corrected Timestamp (UTC)",
+            "Latitude",
+            "Longitude",
+        ]
         self.results_table.setColumnCount(len(target_hdrs))
         self.results_table.setHorizontalHeaderLabels(target_hdrs)
 
@@ -4138,6 +6463,7 @@ function clearAllSavedTransectLines() {
             self.log_message("Populating results table with empty or None dataset.", logging.DEBUG)
             self.results_table.setSortingEnabled(True)
             self.results_table.blockSignals(False)
+            self.results_table.setUpdatesEnabled(True)
             return
         try:
             # Ensure all target headers are present or use available ones, logging discrepancies
@@ -4153,15 +6479,20 @@ function clearAllSavedTransectLines() {
                 self.log_message("No target headers found in DataFrame. Cannot populate table.", logging.ERROR)
                 self.results_table.setSortingEnabled(True)
                 self.results_table.blockSignals(False)
+                self.results_table.setUpdatesEnabled(True)
                 return
 
             self.results_table.setColumnCount(len(display_headers))
             self.results_table.setHorizontalHeaderLabels(display_headers)
 
-            self.results_table.setRowCount(len(df_to_display))
-            for r_idx, (_, row_data) in enumerate(df_to_display.iterrows()):
-                for c_idx, header_name in enumerate(display_headers): # Use the filtered display_headers
-                    value = row_data.get(header_name, pd.NA) # Default to pd.NA if somehow still missing
+            table_data = df_to_display[display_headers]
+            self.results_table.setRowCount(len(table_data))
+            for r_idx, row_values in enumerate(
+                table_data.itertuples(index=False, name=None)
+            ):
+                for c_idx, (header_name, value) in enumerate(
+                    zip(display_headers, row_values)
+                ):
                     display_string = ""
                     try:
                         if pd.isna(value):
@@ -4181,9 +6512,7 @@ function clearAllSavedTransectLines() {
                         display_string = str(value) if pd.notna(value) else "" # Fallback to string or empty
 
                     item = QTableWidgetItem(display_string)
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.results_table.setItem(r_idx, c_idx, item)
-            self.results_table.resizeColumnsToContents()
         except Exception as e:
             self.log_message(f"Error during results table population: {e}", logging.ERROR)
             self.log_message(traceback.format_exc(), logging.DEBUG)
@@ -4191,6 +6520,8 @@ function clearAllSavedTransectLines() {
         finally:
             self.results_table.setSortingEnabled(True)
             self.results_table.blockSignals(False)
+            self.results_table.setUpdatesEnabled(True)
+            self.results_table.viewport().update()
 
     def export_csv(self):
         if self.results_table.rowCount() == 0:
@@ -4388,17 +6719,17 @@ function clearAllSavedTransectLines() {
                 output_path = os.path.join(output_dir, output_base_name)
 
                 _, source_ext = os.path.splitext(actual_source_path)
-                supported_extensions = ['.jpg', '.jpeg', '.tif', '.tiff'] # Check engine for full list
+                supported_extensions = ['.jpg', '.jpeg']
                 if source_ext.lower() not in supported_extensions:
                     self.log_message(f"Skipping ID '{identifier}': Unsupported file type '{source_ext}'. Supported: {supported_extensions}", logging.WARNING)
                     skip_unsupported_type +=1
                     continue
 
-                altitude = row.get('Altitude', 0.0) # Default altitude if not present
+                altitude = row.get('Altitude')
                 try:
-                    alt_float = float(altitude) if pd.notna(altitude) else 0.0
-                except ValueError: # If altitude is non-numeric string
-                    alt_float = 0.0
+                    alt_float = float(altitude) if altitude is not None and pd.notna(altitude) else None
+                except (TypeError, ValueError):
+                    alt_float = None
 
                 # Parse the corrected UTC timestamp from the results so the engine can write it
                 # into EXIF GPSDateStamp/GPSTimeStamp. Without this the engine has no choice but
@@ -4524,17 +6855,24 @@ function clearAllSavedTransectLines() {
                                 f"Could not find source files for {len(missing_source_ids)} selected ID(s).\n"
                                 "Only images with found source files will be copied.")
 
-        ok_copy_count, fail_copy_count = 0, 0
+        ok_copy_count, already_present_count, fail_copy_count = 0, 0, 0
         total_to_copy = len(files_to_copy_info)
         for i, item_info in enumerate(files_to_copy_info):
             try:
-                destination_filename = os.path.basename(item_info['source_path'])
-                destination_path = os.path.join(output_dir, destination_filename)
-                if os.path.exists(destination_path):
-                    # Consider adding a counter or unique name if overwrite is not desired
-                    self.log_message(f"Warning: Destination file '{destination_path}' already exists. Overwriting.", logging.WARNING)
-                shutil.copy2(item_info['source_path'], destination_path)
-                ok_copy_count += 1
+                copy_result = copy_file_safely(
+                    item_info['source_path'],
+                    output_dir,
+                    source_root=self.media_path,
+                )
+                if copy_result.copied:
+                    ok_copy_count += 1
+                else:
+                    already_present_count += 1
+                if copy_result.renamed_for_collision:
+                    self.log_message(
+                        f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                        logging.INFO,
+                    )
             except Exception as e_copy:
                 fail_copy_count += 1
                 self.log_message(f"Error copying image for ID '{item_info['identifier']}' (from '{item_info['source_path']}'): {e_copy}", logging.ERROR)
@@ -4549,10 +6887,16 @@ function clearAllSavedTransectLines() {
 
         summary_message = (f"Image extraction complete.\n\n"
                            f"Successfully copied: {ok_copy_count}\n"
+                           f"Identical files already present: {already_present_count}\n"
                            f"Failed copies: {fail_copy_count}\n\n"
                            f"Output directory:\n{output_dir}")
         QMessageBox.information(self, "Extraction Complete", summary_message)
-        self.log_message(f"Selected image extraction finished. OK: {ok_copy_count}, Failed: {fail_copy_count}. Output: {output_dir}", logging.INFO)
+        self.log_message(
+            f"Selected image extraction finished. OK: {ok_copy_count}, "
+            f"Already present: {already_present_count}, Failed: {fail_copy_count}. "
+            f"Output: {output_dir}",
+            logging.INFO,
+        )
 
     def save_transect(self):
         if not GEOPY_AVAILABLE:
@@ -4692,13 +7036,15 @@ function clearAllSavedTransectLines() {
             except pd.errors.EmptyDataError:
                 self.show_error("Transect CSV file is empty or contains no data after headers.")
                 self.transect_csv_file_path = None
-                if hasattr(self, 'transect_csv_path_display'): self.transect_csv_path_display.clear()
+                if hasattr(self, 'transect_csv_path_display'):
+                    self.transect_csv_path_display.clear()
                 return
 
             if not headers:
                 self.show_error("Could not read headers from Transect CSV file.")
                 self.transect_csv_file_path = None
-                if hasattr(self, 'transect_csv_path_display'): self.transect_csv_path_display.clear()
+                if hasattr(self, 'transect_csv_path_display'):
+                    self.transect_csv_path_display.clear()
                 return
 
             self.log_message(f"Transect CSV Headers: {headers}")
@@ -4721,7 +7067,8 @@ function clearAllSavedTransectLines() {
             self.log_message(f"Transect CSV header processing error: {e}", logging.ERROR)
             self.log_message(traceback.format_exc(), logging.DEBUG)
             self.transect_csv_file_path = None
-            if hasattr(self, 'transect_csv_path_display'): self.transect_csv_path_display.clear()
+            if hasattr(self, 'transect_csv_path_display'):
+                self.transect_csv_path_display.clear()
             self.transect_csv_mapping_group.setVisible(False)
 
     def _guess_transect_csv_columns(self, headers):
@@ -4734,7 +7081,8 @@ function clearAllSavedTransectLines() {
                 if norm_p in headers_lower_map:
                     target_header = headers_lower_map[norm_p]
                     idx = combo.findText(target_header, Qt.MatchFlag.MatchFixedString | Qt.MatchFlag.MatchCaseSensitive)
-                    if idx < 0: idx = combo.findText(target_header, Qt.MatchFlag.MatchFixedString) # Case-insensitive fallback
+                    if idx < 0:
+                        idx = combo.findText(target_header, Qt.MatchFlag.MatchFixedString) # Case-insensitive fallback
                     if idx >= 0:
                         combo.setCurrentIndex(idx)
                         self.log_message(f"Guessed '{target_header}' for Transect CSV {combo.objectName() if combo.objectName() else 'combo'}", logging.DEBUG)
@@ -4784,7 +7132,8 @@ function clearAllSavedTransectLines() {
                     if sample:
                         dialect = csv.Sniffer().sniff(sample)
                         delimiter = dialect.delimiter
-            except: pass # Ignore if sniffing fails again, use default
+            except Exception:
+                pass # Ignore if sniffing fails again, use default
 
             df_transects = pd.read_csv(self.transect_csv_file_path, sep=delimiter, skipinitialspace=True, encoding_errors='ignore', keep_default_na=False, na_values=['', 'NA', 'N/A', '#N/A'])
         except Exception as e:
@@ -4923,30 +7272,42 @@ function clearAllSavedTransectLines() {
 
     def closeEvent(self, event):
         self.log_message("Closing application...", logging.INFO)
-        if self._map_file_path and os.path.exists(self._map_file_path):
-            if "geotagger_map_app_" in os.path.basename(self._map_file_path) or \
-               "geotagger_map_worker_" in os.path.basename(self._map_file_path):
-                try:
-                    os.remove(self._map_file_path)
-                    self.log_message(f"Removed temporary map file: {self._map_file_path}", logging.DEBUG)
-                except OSError as e_remove_map:
-                    self.log_message(f"Error removing temporary map file '{self._map_file_path}': {e_remove_map}", logging.WARNING)
-            else:
-                self.log_message(f"Did not remove map file '{self._map_file_path}' as it doesn't match temp naming convention.", logging.DEBUG)
-
+        if hasattr(self, 'ui_settings'):
+            self.ui_settings.setValue("window_geometry", self.saveGeometry())
+            if hasattr(self, 'main_splitter'):
+                self.ui_settings.setValue(
+                    "main_splitter",
+                    self.main_splitter.saveState(),
+                )
+        worker_map_path = None
         if self.worker_thread and self.worker_thread.isRunning():
-            self.log_message("Terminating worker thread before closing...", logging.WARNING)
-            self.worker_thread.quit()
-            if not self.worker_thread.wait(1000):
-                self.log_message("Worker thread did not quit gracefully, forcing termination.", logging.WARNING)
-                self.worker_thread.terminate()
-                self.worker_thread.wait()
+            self.log_message("Requesting worker cancellation before closing...", logging.WARNING)
+            self._close_when_worker_stops = True
+            self.worker_thread.requestInterruption()
+            if not self.worker_thread.wait(5000):
+                self.log_message(
+                    "Worker is still finishing safely; the window will close when it stops.",
+                    logging.WARNING,
+                )
+                event.ignore()
+                return
+            self._close_when_worker_stops = False
+            worker_map_path = self.worker_thread.map_file
+
+        temporary_map_paths = set(self._stale_temp_map_paths)
+        if self._map_file_path:
+            temporary_map_paths.add(self._map_file_path)
+        if worker_map_path:
+            temporary_map_paths.add(worker_map_path)
+        for temporary_map_path in temporary_map_paths:
+            self._remove_temporary_map_file(temporary_map_path)
+        self._map_file_path = None
 
         super().closeEvent(event)
 
 
 # --- Main Execution ---
-if __name__ == '__main__':
+def main():
     log_file_path = "geotagger_app.log"
     log_format = '%(asctime)s,%(msecs)03d - %(levelname)-8s - [%(filename)s:%(lineno)d] - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
@@ -4964,25 +7325,9 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     app.setStyle("Fusion") # A modern, platform-agnostic style
 
-    # Dependency checks
+    # Optional component checks. Required packages are declared in pyproject.toml
+    # and import before the GUI starts.
     missing_deps = []
-    try:
-        import PyQt6.QtWebEngineCore
-    except ImportError:
-        missing_deps.append("PyQt6-WebEngine (pip install PyQt6-WebEngine)")
-    try:
-        import pandas
-    except ImportError:
-        missing_deps.append("pandas (pip install pandas)")
-    try:
-        import folium
-    except ImportError:
-        missing_deps.append("folium (pip install folium)")
-    try:
-        import pytz
-    except ImportError:
-        missing_deps.append("pytz (pip install pytz)")
-
     if not GEOPY_AVAILABLE: # geopy is optional
         missing_deps.append("geopy (pip install geopy) - Optional, but enables transect length features.")
     if not ENGINE_AVAILABLE: # engine is critical
@@ -4995,13 +7340,13 @@ if __name__ == '__main__':
                         "\n\nPlease install missing libraries.\nApplication exiting."
         QMessageBox.critical(None, "Missing Dependencies", error_message)
         logging.critical(f"FATAL ERROR: Missing critical dependencies: {', '.join(critical_missing_for_dialog)}")
-        sys.exit(1)
+        return 1
 
     if not ENGINE_AVAILABLE:
         engine_missing_msg = "Core component 'georeference_engine.py' not found. Please ensure it is in the same directory as the application or in your Python path. Application cannot run without it."
         QMessageBox.critical(None, "Missing Core Component", engine_missing_msg)
         logging.critical("FATAL ERROR: georeference_engine.py not found.")
-        sys.exit(1)
+        return 1
 
     if not GEOPY_AVAILABLE and not critical_missing_for_dialog and ENGINE_AVAILABLE:
          warn_message = "Optional component 'geopy' is missing.\n\n- geopy (pip install geopy)\n\nSome features (like transect length calculation and preset length enforcement) will be disabled."
@@ -5010,7 +7355,7 @@ if __name__ == '__main__':
 
 
     try:
-        profile = QWebEngineProfile.defaultProfile()
+        QWebEngineProfile.defaultProfile()
         logging.info("Default WebEngine profile obtained.")
     except Exception as e:
         logging.error(f"Could not get default WebEngine profile: {e}. Map functionality might be affected if this persists across runs/systems.")
@@ -5024,11 +7369,15 @@ if __name__ == '__main__':
             print("WARNING: 'geopy' not found. Transect length features are disabled.")
         exit_code = app.exec()
         logging.info(f"==================== Application End (Exit Code: {exit_code}) ====================")
-        sys.exit(exit_code)
+        return exit_code
     except Exception as main_err:
         logging.critical(f"Unhandled top-level exception: {main_err}", exc_info=True)
         try:
             QMessageBox.critical(None, "Fatal Application Error", f"A critical error occurred:\n{main_err}\n\nCheck log file ('{log_file_path}') for details.\nApplication exiting.")
         except Exception:
             print(f"FATAL APPLICATION ERROR: {main_err}\nCheck log file for details: {os.path.abspath(log_file_path)}")
-        sys.exit(1)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

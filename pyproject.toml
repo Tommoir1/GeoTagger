@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geotagger"
+version = "1.15.1"
+description = "Desktop georeferencing tool for matching timestamped images to GPS tracks"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyQt6>=6.5,<7",
+    "PyQt6-WebEngine>=6.5,<7",
+    "folium>=0.15,<1",
+    "geopy>=2.3,<3",
+    "gpxpy>=1.6,<2",
+    "numpy>=1.24,<3",
+    "pandas>=1.5,<3",
+    "piexif>=1.1,<2",
+    "Pillow>=10,<12",
+    "pytz>=2022.7",
+    "scipy>=1.9,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+geotagger = "main:main"
+
+[tool.setuptools]
+py-modules = ["file_utils", "georeference_engine", "main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
