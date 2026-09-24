@@ -1631,7 +1631,7 @@ class GeoTaggerApp(QWidget):
         self.saved_transects = []
         self.autosave_json_path = None
 
-        self.setWindowTitle(f"GeoTagger - v1.15.1{' (Geopy Disabled)' if not GEOPY_AVAILABLE else ''}")
+        self.setWindowTitle(f"GeoTagger - v1.15.2{' (Geopy Disabled)' if not GEOPY_AVAILABLE else ''}")
         self.setObjectName("appRoot")
         self.setMinimumSize(1080, 700)
         self.resize(1500, 920)
@@ -2170,18 +2170,20 @@ class GeoTaggerApp(QWidget):
         self.transect_buffer_spinbox.setValue(2.00)
         self.transect_buffer_spinbox.setSuffix(" m")
         self.transect_buffer_spinbox.setToolTip(
-            "Images within this distance of each transect line will be copied.\n"
+            "Images within this distance of each transect line will be geotagged and saved.\n"
             "Increase this if the image GPS points do not fall exactly on the transect line."
         )
         buffer_layout.addWidget(self.transect_buffer_spinbox)
         buffer_layout.addStretch()
         batch_ops_layout.addLayout(buffer_layout)
 
-        self.batch_process_button = QPushButton("Extract Images for All Listed Transects")
+        self.batch_process_button = QPushButton(
+            "Extract Geotagged Images for All Listed Transects"
+        )
         self.batch_process_button.setIcon(QIcon.fromTheme("view-list-tree"))
         self.batch_process_button.setToolTip(
-             "Extract and save images for ALL transects currently in the list above.\n"
-             "Output will be organized into subfolders."
+             "Extract, geotag, and save images for ALL transects currently in the list above.\n"
+             "Output will be organized into subfolders; source images are not modified."
         )
         self.batch_process_button.clicked.connect(self.batch_process_loaded_transects)
         self.batch_process_button.setEnabled(False)
@@ -2286,9 +2288,12 @@ class GeoTaggerApp(QWidget):
         self.geotag_images_button.setIcon(QIcon.fromTheme("document-save-as"))
         self.geotag_images_button.clicked.connect(self.geotag_images)
         self.geotag_images_button.setEnabled(False)
-        self.extract_button = QPushButton("Extract Selected Images...")
+        self.extract_button = QPushButton("Extract Selected as Geotagged...")
         self.extract_button.setIcon(QIcon.fromTheme("edit-copy"))
-        self.extract_button.setToolTip("Copy image files corresponding to the rows currently SELECTED in the Results Table.")
+        self.extract_button.setToolTip(
+            "Save geotagged copies for rows currently SELECTED in the Results Table. "
+            "Source images are not modified."
+        )
         self.extract_button.clicked.connect(self.extract_selected_images)
         self.extract_button.setEnabled(False)
         export_layout.addStretch()
@@ -2732,6 +2737,143 @@ class GeoTaggerApp(QWidget):
             self.log_message(f"EXIF read failed for '{image_path}': {e}", logging.DEBUG)
             return None, None, None
 
+    @staticmethod
+    def _geotag_values_from_result_row(row):
+        """Return validated (lat, lon, altitude, corrected UTC) values."""
+        latitude = pd.to_numeric(row.get('Latitude'), errors='coerce')
+        longitude = pd.to_numeric(row.get('Longitude'), errors='coerce')
+        if (
+            pd.isna(latitude)
+            or pd.isna(longitude)
+            or not -90 <= float(latitude) <= 90
+            or not -180 <= float(longitude) <= 180
+        ):
+            raise ValueError("image has no valid calculated GPS coordinates")
+
+        altitude_value = pd.to_numeric(row.get('Altitude'), errors='coerce')
+        altitude = float(altitude_value) if pd.notna(altitude_value) else None
+
+        corrected_value = row.get('Corrected Timestamp (UTC)')
+        corrected_utc = None
+        if corrected_value is not None and pd.notna(corrected_value):
+            corrected_timestamp = pd.Timestamp(corrected_value)
+            if corrected_timestamp.tzinfo is None:
+                corrected_timestamp = corrected_timestamp.tz_localize('UTC')
+            else:
+                corrected_timestamp = corrected_timestamp.tz_convert('UTC')
+            corrected_utc = corrected_timestamp.to_pydatetime()
+
+        return float(latitude), float(longitude), altitude, corrected_utc
+
+    def _existing_extraction_matches_geotag(
+        self,
+        output_dir,
+        source_path,
+        latitude,
+        longitude,
+        corrected_utc,
+    ):
+        """Find an existing collision-safe output carrying the requested tag."""
+        source_name = os.path.basename(source_path)
+        source_stem, source_suffix = os.path.splitext(source_name)
+        try:
+            candidate_names = os.listdir(output_dir)
+        except OSError:
+            return None
+
+        for candidate_name in candidate_names:
+            candidate_stem, candidate_suffix = os.path.splitext(candidate_name)
+            if candidate_suffix.casefold() != source_suffix.casefold():
+                continue
+            if not (
+                candidate_name.casefold() == source_name.casefold()
+                or candidate_stem.casefold().startswith(
+                    f"{source_stem.casefold()}__"
+                )
+            ):
+                continue
+            candidate_path = os.path.join(output_dir, candidate_name)
+            if not os.path.isfile(candidate_path):
+                continue
+            existing_lat, existing_lon, existing_utc = self._extract_exif_gps(
+                candidate_path
+            )
+            if existing_lat is None or existing_lon is None:
+                continue
+            if (
+                abs(existing_lat - latitude) > 1e-6
+                or abs(existing_lon - longitude) > 1e-6
+            ):
+                continue
+            if corrected_utc is not None:
+                if existing_utc is None:
+                    continue
+                requested_utc = corrected_utc.astimezone(pytz.utc)
+                if abs((existing_utc - requested_utc).total_seconds()) > 1.0:
+                    continue
+            return candidate_path
+        return None
+
+    def _write_geotagged_extraction(self, row, source_path, output_dir):
+        """Write one collision-safe geotagged copy without touching its source."""
+        if not source_path or not os.path.isfile(source_path):
+            raise FileNotFoundError(f"source image not found: {source_path}")
+        if os.path.splitext(source_path)[1].casefold() not in {'.jpg', '.jpeg'}:
+            raise ValueError(
+                "GPS EXIF writing is currently supported for JPEG images only"
+            )
+
+        latitude, longitude, altitude, corrected_utc = (
+            self._geotag_values_from_result_row(row)
+        )
+        existing_path = self._existing_extraction_matches_geotag(
+            output_dir,
+            source_path,
+            latitude,
+            longitude,
+            corrected_utc,
+        )
+        if existing_path:
+            return {
+                'destination_path': existing_path,
+                'written': False,
+                'already_present': True,
+                'renamed_for_collision': (
+                    os.path.basename(existing_path).casefold()
+                    != os.path.basename(source_path).casefold()
+                ),
+            }
+
+        copy_result = copy_file_safely(
+            source_path,
+            output_dir,
+            source_root=self.media_path,
+        )
+        geotagged = engine.set_gps_location(
+            source_path,
+            latitude,
+            longitude,
+            altitude,
+            copy_result.destination_path,
+            gps_time_utc=corrected_utc,
+        )
+        if not geotagged:
+            # Remove only a file created by this attempt. Never remove an older
+            # user file that copy_file_safely elected to reuse.
+            if copy_result.copied:
+                try:
+                    os.remove(copy_result.destination_path)
+                except OSError:
+                    pass
+            raise OSError("failed to write GPS EXIF metadata")
+
+        return {
+            'destination_path': copy_result.destination_path,
+            'written': True,
+            'already_present': False,
+            'renamed_for_collision': copy_result.renamed_for_collision,
+        }
+
 
     def load_images_with_embedded_gps(self):
         """Load a folder of images with EXIF GPS. Builds the GPS track and results
@@ -2901,21 +3043,29 @@ class GeoTaggerApp(QWidget):
                 source_path = self.identifier_to_path_map.get(row.get('Identifier'))
                 if source_path and os.path.exists(source_path):
                     try:
-                        copy_result = copy_file_safely(
+                        extraction_result = self._write_geotagged_extraction(
+                            row,
                             source_path,
                             specific_transect_output_dir,
-                            source_root=self.media_path,
                         )
-                        if copy_result.renamed_for_collision:
+                        if extraction_result['renamed_for_collision']:
                             self.log_message(
-                                f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                f"Preserved duplicate filename as "
+                                f"'{os.path.basename(extraction_result['destination_path'])}'.",
                                 logging.INFO,
                             )
                         copy_ok_count += 1
                     except Exception as copy_e:
-                        self.log_message(f"Error copying image for transect '{transect_name}': {copy_e}", logging.ERROR)
+                        self.log_message(
+                            f"Error geotagging extracted image for transect "
+                            f"'{transect_name}': {copy_e}",
+                            logging.ERROR,
+                        )
 
-        self.log_message(f"Saved {copy_ok_count} images for transect '{transect_name}'.")
+            self.log_message(
+            f"Saved {copy_ok_count} geotagged images for transect "
+            f"'{transect_name}'."
+        )
 
         active_gps_df = self.get_active_gps_df()
         try:
@@ -3645,21 +3795,30 @@ class GeoTaggerApp(QWidget):
                     source_path = self.identifier_to_path_map.get(row.get('Identifier'))
                     if source_path and os.path.exists(source_path):
                         try:
-                            copy_result = copy_file_safely(
+                            extraction_result = self._write_geotagged_extraction(
+                                row,
                                 source_path,
                                 specific_transect_output_dir,
-                                source_root=self.media_path,
                             )
-                            if copy_result.renamed_for_collision:
+                            if extraction_result['renamed_for_collision']:
                                 self.log_message(
-                                    f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                    f"Preserved duplicate filename as "
+                                    f"'{os.path.basename(extraction_result['destination_path'])}'.",
                                     logging.INFO,
                                 )
                             copy_ok_count += 1
                         except Exception as copy_e:
-                            self.log_message(f"Error copying image for transect '{transect_name}': {copy_e}", logging.ERROR)
-            
-            self.log_message(f"Extracted and saved {copy_ok_count} images for transect '{transect_name}'.", logging.INFO)
+                            self.log_message(
+                                f"Error geotagging extracted image for transect "
+                                f"'{transect_name}': {copy_e}",
+                                logging.ERROR,
+                            )
+
+            self.log_message(
+                f"Extracted and saved {copy_ok_count} geotagged images for "
+                f"transect '{transect_name}'.",
+                logging.INFO,
+            )
 
         # 5. Create the transect data dictionary for the JSON file
         new_transect_data = {
@@ -3785,7 +3944,7 @@ class GeoTaggerApp(QWidget):
 
         reply = QMessageBox.question(self, "Confirm Batch Process",
                                      f"This will process {len(self.saved_transects)} transect(s).\n"
-                                     "Images will be filtered and copied into subfolders based on transect names.\n"
+                                     "Images will be filtered, geotagged, and saved into subfolders based on transect names.\n"
                                      "This may take some time. Do you want to proceed?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.Yes)
@@ -3846,26 +4005,36 @@ class GeoTaggerApp(QWidget):
                         copy_fail_count_this_transect += 1
                         continue
                     try:
-                        copy_result = copy_file_safely(
+                        extraction_result = self._write_geotagged_extraction(
+                            row,
                             source_path,
                             specific_transect_output_dir,
-                            source_root=self.media_path,
                         )
                         copy_ok_count_this_transect += 1
-                        if copy_result.copied:
+                        if extraction_result['written']:
                             total_images_copied += 1
                         else:
                             total_images_already_present += 1
-                        if copy_result.renamed_for_collision:
+                        if extraction_result['renamed_for_collision']:
                             self.log_message(
-                                f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                f"Preserved duplicate filename as "
+                                f"'{os.path.basename(extraction_result['destination_path'])}'.",
                                 logging.INFO,
                             )
                     except Exception as copy_e:
                         copy_fail_count_this_transect += 1
-                        self.log_message(f"Error copying image ID '{identifier}' for transect '{transect_name}': {copy_e}", logging.ERROR)
+                        self.log_message(
+                            f"Error geotagging extracted image ID '{identifier}' "
+                            f"for transect '{transect_name}': {copy_e}",
+                            logging.ERROR,
+                        )
 
-                self.log_message(f"Transect '{transect_name}' processing complete. Copied: {copy_ok_count_this_transect}, Failed: {copy_fail_count_this_transect}", logging.INFO)
+                self.log_message(
+                    f"Transect '{transect_name}' processing complete. "
+                    f"Geotagged: {copy_ok_count_this_transect}, "
+                    f"Failed: {copy_fail_count_this_transect}",
+                    logging.INFO,
+                )
                 total_transects_processed +=1
 
             except Exception as e_transect_proc:
@@ -3880,8 +4049,8 @@ class GeoTaggerApp(QWidget):
         self._update_batch_processing_ui_states()
 
         summary_msg = f"Batch processing finished.\n\nProcessed {total_transects_processed}/{len(self.saved_transects)} transects.\n" \
-                      f"Total images copied: {total_images_copied}.\n" \
-                      f"Identical images already present: {total_images_already_present}.\n"
+                      f"New geotagged images written: {total_images_copied}.\n" \
+                      f"Matching geotagged images already present: {total_images_already_present}.\n"
         if failed_transects:
             summary_msg += f"\nFailed to process {len(failed_transects)} transect(s):\n- " + "\n- ".join(failed_transects)
             summary_msg += "\n\nCheck log for details."
@@ -6031,21 +6200,29 @@ class GeoTaggerApp(QWidget):
                     source_path = self.identifier_to_path_map.get(identifier)
                     if source_path and os.path.exists(source_path):
                         try:
-                            copy_result = copy_file_safely(
+                            extraction_result = self._write_geotagged_extraction(
+                                row,
                                 source_path,
                                 specific_transect_output_dir,
-                                source_root=self.media_path,
                             )
-                            if copy_result.renamed_for_collision:
+                            if extraction_result['renamed_for_collision']:
                                 self.log_message(
-                                    f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                                    f"Preserved duplicate filename as "
+                                    f"'{os.path.basename(extraction_result['destination_path'])}'.",
                                     logging.INFO,
                                 )
                             copy_ok_count += 1
                         except Exception as copy_e:
-                            self.log_message(f"Error copying image ID '{identifier}' for transect '{safe_transect_name}': {copy_e}", logging.ERROR)
+                            self.log_message(
+                                f"Error geotagging extracted image ID '{identifier}' "
+                                f"for transect '{safe_transect_name}': {copy_e}",
+                                logging.ERROR,
+                            )
 
-            self.log_message(f"Saved {copy_ok_count} images for transect '{safe_transect_name}'.")
+            self.log_message(
+                f"Saved {copy_ok_count} geotagged images for transect "
+                f"'{safe_transect_name}'."
+            )
 
             # Get coordinates for saving
             try:
@@ -6839,11 +7016,28 @@ function clearAllSavedTransectLines() {
         missing_source_ids = []
         for sid in selected_ids_from_table:
             source_path = self.identifier_to_path_map.get(sid)
-            if source_path and os.path.exists(source_path):
-                files_to_copy_info.append({'identifier': sid, 'source_path': source_path})
+            matching_rows = self.results_df[
+                self.results_df['Identifier'].astype(str) == str(sid)
+            ]
+            if (
+                source_path
+                and os.path.exists(source_path)
+                and not matching_rows.empty
+            ):
+                files_to_copy_info.append(
+                    {
+                        'identifier': sid,
+                        'source_path': source_path,
+                        'result_row': matching_rows.iloc[0],
+                    }
+                )
             else:
                 missing_source_ids.append(sid)
-                self.log_message(f"Source file for selected ID '{sid}' not found at '{source_path if source_path else 'path not in map'}'. Skipping.", logging.WARNING)
+                self.log_message(
+                    f"Source file or georeferencing result for selected ID "
+                    f"'{sid}' was not found. Skipping.",
+                    logging.WARNING,
+                )
 
         if not files_to_copy_info:
             self.show_error("Could not find valid source files for any of the selected image Identifiers.")
@@ -6859,23 +7053,29 @@ function clearAllSavedTransectLines() {
         total_to_copy = len(files_to_copy_info)
         for i, item_info in enumerate(files_to_copy_info):
             try:
-                copy_result = copy_file_safely(
+                extraction_result = self._write_geotagged_extraction(
+                    item_info['result_row'],
                     item_info['source_path'],
                     output_dir,
-                    source_root=self.media_path,
                 )
-                if copy_result.copied:
+                if extraction_result['written']:
                     ok_copy_count += 1
                 else:
                     already_present_count += 1
-                if copy_result.renamed_for_collision:
+                if extraction_result['renamed_for_collision']:
                     self.log_message(
-                        f"Preserved duplicate filename as '{os.path.basename(copy_result.destination_path)}'.",
+                        f"Preserved duplicate filename as "
+                        f"'{os.path.basename(extraction_result['destination_path'])}'.",
                         logging.INFO,
                     )
             except Exception as e_copy:
                 fail_copy_count += 1
-                self.log_message(f"Error copying image for ID '{item_info['identifier']}' (from '{item_info['source_path']}'): {e_copy}", logging.ERROR)
+                self.log_message(
+                    f"Error geotagging extracted image for ID "
+                    f"'{item_info['identifier']}' "
+                    f"(from '{item_info['source_path']}'): {e_copy}",
+                    logging.ERROR,
+                )
 
             prog = int(((i + 1) / total_to_copy) * 100) if total_to_copy > 0 else 0
             self.progress_bar.setValue(prog)
@@ -6886,13 +7086,13 @@ function clearAllSavedTransectLines() {
         self.extract_button.setEnabled(bool(self.results_table.selectionModel().hasSelection())) # Re-enable based on selection state
 
         summary_message = (f"Image extraction complete.\n\n"
-                           f"Successfully copied: {ok_copy_count}\n"
-                           f"Identical files already present: {already_present_count}\n"
-                           f"Failed copies: {fail_copy_count}\n\n"
+                           f"New geotagged images written: {ok_copy_count}\n"
+                           f"Matching geotagged images already present: {already_present_count}\n"
+                           f"Failed geotagged exports: {fail_copy_count}\n\n"
                            f"Output directory:\n{output_dir}")
         QMessageBox.information(self, "Extraction Complete", summary_message)
         self.log_message(
-            f"Selected image extraction finished. OK: {ok_copy_count}, "
+            f"Selected geotagged image extraction finished. Written: {ok_copy_count}, "
             f"Already present: {already_present_count}, Failed: {fail_copy_count}. "
             f"Output: {output_dir}",
             logging.INFO,

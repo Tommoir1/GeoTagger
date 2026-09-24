@@ -79,7 +79,7 @@ geotagger
 7. Click **Process Data**.
 8. Review image positions on the map and in the results table.
 9. Define transects or load transects from JSON/CSV.
-10. Extract images, export the table, save the map, or save geotagged image copies.
+10. Extract geotagged images, export the table, or save the map.
 
 ## Timestamp Workflow
 
@@ -213,7 +213,7 @@ GeoTagger supports three transect workflows.
 
 ### Manual Transects
 
-After processing GPS and image data, click **Define Transect Start/End**, then click the start and end GPS points on the map. When prompted, name the transect. Images with corrected timestamps inside that start/end time window are copied to:
+After processing GPS and image data, click **Define Transect Start/End**, then click the start and end GPS points on the map. When prompted, name the transect. Images with corrected timestamps inside that start/end time window are written as geotagged JPEG copies to:
 
 ```text
 transects_output/<transect_name>/
@@ -259,7 +259,9 @@ For time-based transect CSVs, timestamps are interpreted using the selected **Da
 
 ## Batch Extraction
 
-Batch extraction currently copies images whose georeferenced points fall within a configurable buffer distance of each transect line. The default buffer is 2 metres.
+Batch extraction writes geotagged JPEG copies whose calculated points fall within a configurable buffer distance of each transect line. The default buffer is 2 metres. Each output receives its calculated latitude/longitude and corrected UTC GPS timestamp in EXIF; source images remain unchanged.
+
+Re-running extraction into an existing transect folder upgrades an identical untagged copy in place. An output that already contains the requested GPS metadata is retained without creating another duplicate.
 
 Output is written to:
 

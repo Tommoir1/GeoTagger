@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geotagger"
-version = "1.15.1"
+version = "1.15.2"
 description = "Desktop georeferencing tool for matching timestamped images to GPS tracks"
 readme = "README.md"
 requires-python = ">=3.9"

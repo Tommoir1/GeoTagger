@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta
 from pathlib import Path
+import shutil
 
 import pandas as pd
+import piexif
 from PIL import Image
 from PyQt6.QtWidgets import QApplication
 
@@ -211,6 +213,78 @@ def test_show_all_dates_timezone_change_updates_labels_without_map_rebuild():
     assert app.current_timezone_str == "Australia/Perth"
     assert app.map_label_updates == 1
     assert app.filtered_gps_by_date_df is app.processed_gps_df
+
+
+def test_extraction_writes_gps_and_upgrades_existing_untagged_copy(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "frame.jpg"
+    exif_bytes = piexif.dump(
+        {
+            "0th": {},
+            "Exif": {
+                piexif.ExifIFD.DateTimeOriginal: b"2026:03:27 07:00:00",
+            },
+            "GPS": {},
+            "1st": {},
+            "thumbnail": None,
+        }
+    )
+    Image.new("RGB", (16, 12), "white").save(source, exif=exif_bytes)
+    source_bytes = source.read_bytes()
+    result_row = pd.Series(
+        {
+            "Latitude": -29.0551234,
+            "Longitude": 167.9534567,
+            "Corrected Timestamp (UTC)": pd.Timestamp(
+                "2026-03-26T20:00:00.500Z"
+            ),
+        }
+    )
+
+    class AppStub:
+        media_path = str(source_dir)
+        _extract_exif_gps = GeoTaggerApp._extract_exif_gps
+        _geotag_values_from_result_row = staticmethod(
+            GeoTaggerApp._geotag_values_from_result_row
+        )
+        _existing_extraction_matches_geotag = (
+            GeoTaggerApp._existing_extraction_matches_geotag
+        )
+        _write_geotagged_extraction = GeoTaggerApp._write_geotagged_extraction
+
+        def log_message(self, *_args):
+            pass
+
+    app = AppStub()
+    output_dir = tmp_path / "transect"
+    output_dir.mkdir()
+    untagged_output = output_dir / source.name
+    shutil.copy2(source, untagged_output)
+
+    first = app._write_geotagged_extraction(
+        result_row,
+        str(source),
+        str(output_dir),
+    )
+    output_gps = piexif.load(first["destination_path"])["GPS"]
+
+    assert first["written"]
+    assert piexif.GPSIFD.GPSLatitude in output_gps
+    assert piexif.GPSIFD.GPSLongitude in output_gps
+    assert piexif.GPSIFD.GPSDateStamp in output_gps
+    assert source.read_bytes() == source_bytes
+    assert len(list(output_dir.glob("*.jpg"))) == 1
+
+    second = app._write_geotagged_extraction(
+        result_row,
+        str(source),
+        str(output_dir),
+    )
+
+    assert second["already_present"]
+    assert not second["written"]
+    assert len(list(output_dir.glob("*.jpg"))) == 1
 
 
 def test_only_geotagger_generated_maps_are_treated_as_temporary():
